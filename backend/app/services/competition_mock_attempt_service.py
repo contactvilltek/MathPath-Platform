@@ -1,0 +1,1464 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.core.errors import api_error
+from app.services.competition_mock_generation_service import _MmCompetitionPadVisualAddLessRows
+from app.models import (
+    CompetitionMockAssignment,
+    CompetitionMockAttempt,
+    CompetitionMockAttemptAnswer,
+    CompetitionMockExam,
+    CompetitionMockQuestion,
+    CompetitionMockQuestionOption,
+    CompetitionMockResultSummary,
+    Level,
+    Module,
+    Student,
+    Teacher,
+    User,
+)
+from app.services.notification_service import CreateNotification
+
+COMPLETED_STATUSES = {"SUBMITTED", "AUTO_SUBMITTED", "COMPLETED", "EXPIRED", "LOCKED"}
+ACTIVE_STATUS = "IN_PROGRESS"
+
+MM_COMPETITION_SECTION_TITLES: dict[int, str] = {
+    1: "Add/Less (Abacus)",
+    2: "Add/Less (Visual)",
+    3: "Multiplication",
+    4: "Division",
+    5: "Positional & Placement",
+    6: "Squares and Square Roots",
+    7: "Cubes and Cube Roots",
+    8: "BODMAS, Solve Equation, Add/Less Percentage",
+    9: "Profit/Loss, Simple Interest, Selling Price",
+    10: "Skill Stacker, Concept Drill",
+}
+
+
+def _competition_section_title(question: CompetitionMockQuestion) -> str:
+    # The generator (competition_mock_generation_service.py) persists the correct,
+    # module-specific title on every question at creation time for both MM and IM
+    # mocks. MM_COMPETITION_SECTION_TITLES below is a legacy fallback for older rows
+    # that predate that persisted title - it must never win over the real value,
+    # since its section numbers 1-10 are MM-specific and collide with IM's own
+    # 1-8 numbering (e.g. IM section 7 "Positional and Placement" was being
+    # overwritten with MM section 7 "Cubes and Cube Roots").
+    if question.section_title:
+        return question.section_title
+    try:
+        section_number = int(question.section_number or 0)
+    except Exception:
+        section_number = 0
+    return MM_COMPETITION_SECTION_TITLES.get(section_number) or "Competition Mock"
+
+
+# A handful of competition-only sub-generators (competition_mock_generation_
+# service.py) tag their questions with a synthetic, verbose "Challenge"-suffixed
+# label instead of the one real concept name a student would recognize from
+# regular DPS practice -- e.g. "BODMAS Competition Challenge" and "BODMAS
+# Square Root Decimal Percentage Challenge" are both just BODMAS underneath;
+# there's no such thing as two different "BODMAS" concepts in the curriculum
+# (confirmed against seed_master_module.py's real DPS lesson titles, which
+# only ever say plain "BODMAS" / "BODMAS (Visual)"). This maps those specific
+# synthetic labels back to the single real concept name (2026-07-19,
+# Shailesh). Deliberately NOT a blanket "strip the word Challenge" rule --
+# most competition concept titles (digit-pattern multiplication/division
+# variants, Add/Less variants, Squares, Cubes, etc.) are already real,
+# individually distinct DPS concepts and must stay separate so a student can
+# see exactly which specific pattern they're weak in, not just a broad
+# section. Only entries confirmed to be multiple synthetic labels for one
+# real concept are collapsed here.
+_COMPETITION_CONCEPT_NAME_OVERRIDES: dict[str, str] = {
+    "BODMAS Competition Challenge": "BODMAS",
+    "BODMAS Square Root Decimal Percentage Challenge": "BODMAS",
+    "BODMAS with Square Term": "BODMAS",
+    "Solve Equation Competition Challenge": "Solve Equation",
+    "Add Percentage Challenge": "Add Percentage",
+    "Less Percentage Challenge": "Less Percentage",
+    "Add-Less Percentage Challenge": "Add-Less Percentage",
+}
+
+
+def _canonical_competition_concept_name(question: CompetitionMockQuestion) -> str:
+    """The individual, student-recognizable concept name for one question --
+    e.g. "BODMAS", "2D × 2D Multiplication", "Add Percentage" -- used to group
+    Strengths/Areas to Improve at the same fine-grained level a student sees
+    real practice concepts at, instead of either the raw (sometimes synthetic
+    or over-verbose) generator label or the much broader section title.
+
+    Priority mirrors _competition_section_title(): concept_tag is persisted on
+    every competition question at generation time (competition_mock_
+    generation_service.py), so it's the primary source; concept_family and the
+    section title are defensive fallbacks for the rare row missing it.
+    """
+    raw = (question.concept_tag or "").strip()
+    if not raw and question.concept_family and question.concept_family != "MM_UNSUPPORTED":
+        raw = _format_concept_family(question.concept_family)
+    if not raw:
+        raw = _competition_section_title(question)
+    return _COMPETITION_CONCEPT_NAME_OVERRIDES.get(raw, raw)
+
+
+def _section_display_number_map(real_section_numbers: Any) -> dict[int, int]:
+    """Maps each real (fixed, 1-10) section_number actually present in this
+    exam's question set to a sequential 1..N display number, closing any
+    gaps left when a section was omitted (0 questions generated) for a
+    student's level. This mirrors the same renumbering already applied on
+    the admin Mock Studio page and the student pre-exam instructions page,
+    so the section count/labels a student sees before, during, and after a
+    mock stay consistent.
+
+    Callers must keep using the REAL section_number (not this map's output)
+    for anything concept-specific — e.g. MM_COMPETITION_SECTION_TITLES
+    lookups — since that dict is keyed by the fixed 1-10 concept numbers,
+    not display position. Only apply this map to values that are purely
+    for display (a "Section N" badge/heading).
+    """
+    try:
+        uniques = sorted({int(n or 0) for n in real_section_numbers})
+    except Exception:
+        return {}
+    return {real: idx + 1 for idx, real in enumerate(uniques)}
+
+
+def _section_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    try:
+        return (int(item.get("sectionNumber") or 999), str(item.get("concept") or ""))
+    except Exception:
+        return (999, str(item.get("concept") or ""))
+
+
+def _section_performance_from_review(review: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    # Grouped by individual concept (2026-07-19, Shailesh), not by section --
+    # see _canonical_competition_concept_name()'s docstring for why. Each
+    # question already carries its concept name (set in
+    # _question_review_payload()) plus its section identity, which is kept
+    # on every bucket (sectionNumber/sectionTitle) purely so the frontend can
+    # still jump to the right spot in the Question Review tab when a student
+    # taps a concept -- the section is still the right *scroll target* even
+    # though it's no longer the *display/grouping* label.
+    concept_totals: dict[str, dict[str, Any]] = {}
+    for question in review:
+        try:
+            section_number = int(question.get("sectionNumber") or 0)
+        except Exception:
+            section_number = 0
+        # See _competition_section_title() above: the persisted per-question title
+        # is always correct and module-specific; the fixed MM dict is only a
+        # legacy fallback and must not override it.
+        section_title = question.get("sectionTitle") or MM_COMPETITION_SECTION_TITLES.get(section_number) or "Competition Mock"
+        concept_name = question.get("concept") or section_title
+        bucket = concept_totals.setdefault(
+            concept_name,
+            {
+                "concept": concept_name,
+                "sectionNumber": section_number,
+                "sectionTitle": section_title,
+                "correct": 0,
+                "total": 0,
+                "percentage": 0.0,
+            },
+        )
+        bucket["total"] += 1
+        if question.get("isCorrect"):
+            bucket["correct"] += 1
+    performance: list[dict[str, Any]] = []
+    strengths: list[dict[str, Any]] = []
+    weaknesses: list[dict[str, Any]] = []
+    for item in sorted(concept_totals.values(), key=_section_sort_key):
+        total = int(item["total"] or 0)
+        correct = int(item["correct"] or 0)
+        percentage = round((correct / total) * 100) if total else 0.0
+        payload = {**item, "percentage": percentage}
+        performance.append(payload)
+        # Single clean 70% cutoff (2026-07-19, Shailesh) -- every UI surface
+        # ("Strengths >= 70% Accuracy" / "Areas to Improve < 70% Accuracy")
+        # advertises one 70% threshold, but this used to be >=75 / <60, which
+        # left a silent 60-74% dead zone: a section scoring 60-74% appeared in
+        # neither list, on the admin, teacher, AND student result pages (this
+        # function backs GetCompetitionMockResultFor{Student,Teacher,Admin}
+        # via the shared _result_payload()). Confirmed live: a 60% section and
+        # two 70% sections were invisible in both Strengths and Weak Areas,
+        # and missing from the "Focus Next" coaching message that reads off
+        # the weaknesses list.
+        if percentage >= 70:
+            strengths.append(payload)
+        else:
+            weaknesses.append(payload)
+    return performance, strengths, weaknesses
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _json_loads(value: str | None, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def _remaining_seconds(attempt: CompetitionMockAttempt) -> int:
+    expires_at = _aware(attempt.expires_at)
+    if not expires_at:
+        return 0
+    return max(0, int((expires_at - _now_utc()).total_seconds()))
+
+
+def _duration_seconds(started_at: datetime | None, submitted_at: datetime | None, max_duration: int) -> int | None:
+    if not started_at or not submitted_at:
+        return None
+    elapsed = int((_aware(submitted_at) - _aware(started_at)).total_seconds())
+    return max(0, min(max_duration, elapsed))
+
+
+def _performance_band(percentage: float) -> str:
+    if percentage >= 90:
+        return "EXCELLENT"
+    if percentage >= 75:
+        return "STRONG"
+    if percentage >= 60:
+        return "DEVELOPING"
+    return "NEEDS_PRACTICE"
+
+
+def _question_payload(
+    question: CompetitionMockQuestion,
+    options: list[CompetitionMockQuestionOption],
+    saved_answer: CompetitionMockAttemptAnswer | None = None,
+    display_section_number: int | None = None,
+) -> dict[str, Any]:
+    metadata = _json_loads(question.metadata_json, {})
+    section_title = _competition_section_title(question)
+    shaped_question = _MmCompetitionPadVisualAddLessRows(
+        {
+            "question_text": question.question_text,
+            "operands": _json_loads(question.operands_json, []),
+            "operators": _json_loads(question.operators_json, []),
+            "metadata": metadata,
+        },
+        SectionKey=str(metadata.get("competitionSectionKey") or ("MM_VISUAL_ADD_LESS" if int(question.section_number or 0) == 2 else "")),
+        ConceptTitle=str(metadata.get("competitionConceptKey") or question.concept_tag or section_title),
+        Seed=f"ATTEMPT-VISUAL-NORMALIZE-{question.id}",
+    )
+    metadata = dict(shaped_question.get("metadata") if isinstance(shaped_question.get("metadata"), dict) else metadata)
+    metadata.update({
+        # Display-only renumbered section number (gap-free 1..N) when a
+        # display map was provided by the caller; falls back to the real
+        # number so nothing breaks if this is ever called without a map.
+        "section_number": display_section_number if display_section_number is not None else question.section_number,
+        "section_title": section_title,
+        "sectionTitle": section_title,
+        "concept_family": question.concept_family,
+        "concept_tag": question.concept_tag,
+        "mock_mode": "COMPETITION_MOCK",
+    })
+    return {
+        "questionId": question.id,
+        "questionNumber": question.question_number,
+        "displayType": question.display_type,
+        "questionText": question.question_text,
+        "operands": shaped_question.get("operands") or [],
+        "operators": shaped_question.get("operators") or [],
+        "metadata": metadata,
+        "options": [
+            {
+                "optionId": option.id,
+                "label": option.option_label,
+                "value": option.option_value,
+            }
+            for option in options
+        ],
+        "savedOptionId": saved_answer.selected_option_id if saved_answer else None,
+    }
+
+
+def _attempt_payload(db: Session, attempt: CompetitionMockAttempt) -> dict[str, Any]:
+    assignment = db.get(CompetitionMockAssignment, attempt.mock_assignment_id)
+    exam = db.get(CompetitionMockExam, attempt.mock_exam_id)
+    if not assignment or not exam:
+        api_error(404, "COMPETITION_ATTEMPT_NOT_FOUND", "Competition mock attempt could not be loaded.")
+
+    questions = (
+        db.query(CompetitionMockQuestion)
+        .filter(CompetitionMockQuestion.mock_exam_id == exam.id)
+        .order_by(CompetitionMockQuestion.question_number.asc())
+        .all()
+    )
+    option_rows = []
+    if questions:
+        option_rows = (
+            db.query(CompetitionMockQuestionOption)
+            .filter(CompetitionMockQuestionOption.mock_question_id.in_([q.id for q in questions]))
+            .order_by(CompetitionMockQuestionOption.display_order.asc())
+            .all()
+        )
+    options_by_question: dict[str, list[CompetitionMockQuestionOption]] = {}
+    for option in option_rows:
+        options_by_question.setdefault(option.mock_question_id, []).append(option)
+
+    answer_rows = (
+        db.query(CompetitionMockAttemptAnswer)
+        .filter(CompetitionMockAttemptAnswer.mock_attempt_id == attempt.id)
+        .all()
+    )
+    answers_by_question = {answer.mock_question_id: answer for answer in answer_rows}
+
+    module_record = db.get(Module, exam.module_id)
+    level_record = db.get(Level, exam.level_id)
+    section_display_map = _section_display_number_map(q.section_number for q in questions)
+
+    return {
+        "attemptId": attempt.id,
+        "assignmentId": assignment.id,
+        "mockExamId": exam.id,
+        "status": attempt.status,
+        "mode": "COMPETITION",
+        "startedAt": attempt.started_at.isoformat() if attempt.started_at else None,
+        "expiresAt": attempt.expires_at.isoformat() if attempt.expires_at else None,
+        "serverTime": _now_utc().isoformat(),
+        "remainingSeconds": _remaining_seconds(attempt),
+        "durationSeconds": attempt.duration_seconds,
+        "totalQuestions": len(questions),
+        "answeredCount": len([answer for answer in answer_rows if answer.selected_option_id]),
+        "mockExam": {
+            "title": exam.title,
+            "mockCode": exam.mock_code,
+            "totalQuestions": exam.total_questions,
+            "totalMarks": exam.total_marks,
+            "marksPerQuestion": exam.marks_per_question,
+            "durationSeconds": exam.duration_seconds,
+            "moduleCode": module_record.module_code if module_record else None,
+            "levelCode": level_record.level_code if level_record else None,
+        },
+        "questions": [
+            _question_payload(
+                question,
+                options_by_question.get(question.id, []),
+                answers_by_question.get(question.id),
+                display_section_number=section_display_map.get(int(question.section_number or 0)),
+            )
+            for question in questions
+        ],
+    }
+
+
+def _completed_attempt_history_payload(db: Session, assignment_id: str) -> list[dict[str, Any]]:
+    """All completed attempts for this assignment, oldest first.
+
+    Additive helper for activity feeds (e.g. the student dashboard grind
+    heatmap) that need every attempt on a given day, not just the latest.
+    Does not change or replace any existing single-attempt fields.
+    """
+    attempts = (
+        db.query(CompetitionMockAttempt)
+        .filter(
+            CompetitionMockAttempt.mock_assignment_id == assignment_id,
+            CompetitionMockAttempt.status.in_(list(COMPLETED_STATUSES)),
+        )
+        .order_by(CompetitionMockAttempt.attempt_number.asc(), CompetitionMockAttempt.started_at.asc())
+        .all()
+    )
+    history: list[dict[str, Any]] = []
+    for attempt in attempts:
+        result = (
+            db.query(CompetitionMockResultSummary)
+            .filter(CompetitionMockResultSummary.mock_attempt_id == attempt.id)
+            .first()
+        )
+        if not result or not result.completed_at:
+            continue
+        history.append({
+            "attemptId": attempt.id,
+            "attemptNumber": attempt.attempt_number,
+            "score": result.score,
+            "maxScore": result.max_score,
+            "accuracyPercentage": result.accuracy_percentage,
+            "timeTakenSeconds": result.time_taken_seconds,
+            "expectedDurationSeconds": attempt.duration_seconds,
+            "totalQuestions": attempt.total_questions,
+            "completedAt": result.completed_at.isoformat(),
+        })
+    return history
+
+
+def _assignment_with_current_attempt_payload(db: Session, assignment: CompetitionMockAssignment) -> dict[str, Any]:
+    exam = db.get(CompetitionMockExam, assignment.mock_exam_id)
+    if not exam:
+        return {}
+    level_record = db.get(Level, exam.level_id)
+    module_record = db.get(Module, exam.module_id)
+    latest_attempt = (
+        db.query(CompetitionMockAttempt)
+        .filter(CompetitionMockAttempt.mock_assignment_id == assignment.id)
+        .order_by(CompetitionMockAttempt.attempt_number.desc(), CompetitionMockAttempt.started_at.desc())
+        .first()
+    )
+    status = assignment.status
+    if latest_attempt and latest_attempt.status == ACTIVE_STATUS:
+        status = "IN_PROGRESS"
+    elif latest_attempt and latest_attempt.status in COMPLETED_STATUSES:
+        status = "COMPLETED"
+
+    latest_result = None
+    if latest_attempt and latest_attempt.status in COMPLETED_STATUSES:
+        latest_result = (
+            db.query(CompetitionMockResultSummary)
+            .filter(CompetitionMockResultSummary.mock_attempt_id == latest_attempt.id)
+            .first()
+        )
+
+    return {
+        "assignmentId": assignment.id,
+        "mockExamId": exam.id,
+        "status": status,
+        "assignmentStatus": assignment.status,
+        "currentAttemptNumber": assignment.current_attempt_number,
+        "maxAttempts": assignment.max_attempts,
+        "assignedAt": assignment.assigned_at.isoformat() if assignment.assigned_at else None,
+        "dueAt": assignment.due_at.isoformat() if assignment.due_at else None,
+        "instructions": assignment.instructions,
+        "latestAttemptId": latest_attempt.id if latest_attempt else None,
+        "latestAttemptStatus": latest_attempt.status if latest_attempt else None,
+        "latestResult": (
+            {
+                "score": latest_result.score,
+                "maxScore": latest_result.max_score,
+                "percentage": latest_result.percentage,
+                "accuracyPercentage": latest_result.accuracy_percentage,
+                "timeTakenSeconds": latest_result.time_taken_seconds,
+                "timeUtilizationPercentage": latest_result.time_utilization_percentage,
+                "performanceBand": latest_result.performance_band,
+                "completedAt": latest_result.completed_at.isoformat() if latest_result.completed_at else None,
+                "correctCount": latest_attempt.correct_count if latest_attempt else 0,
+                "totalQuestions": latest_attempt.total_questions if latest_attempt else 0,
+                "attemptedCount": latest_attempt.attempted_count if latest_attempt else 0,
+                "unansweredCount": latest_attempt.unanswered_count if latest_attempt else 0,
+            }
+            if latest_result else None
+        ),
+        "attemptHistory": _completed_attempt_history_payload(db, assignment.id),
+        "mockExam": {
+            "mockExamId": exam.id,
+            "title": exam.title,
+            "mockCode": exam.mock_code,
+            "status": exam.status,
+            "totalQuestions": exam.total_questions,
+            "totalMarks": exam.total_marks,
+            "marksPerQuestion": exam.marks_per_question,
+            "durationSeconds": exam.duration_seconds,
+            "moduleId": exam.module_id,
+            "moduleCode": module_record.module_code if module_record else None,
+            "moduleName": module_record.module_name if module_record else None,
+            "levelId": exam.level_id,
+            "levelCode": level_record.level_code if level_record else None,
+            "levelName": level_record.level_name if level_record else None,
+        },
+    }
+
+
+def ListStudentCompetitionMockAssignmentsForAttempt(db: Session, student: Student) -> list[dict[str, Any]]:
+    query = (
+        db.query(CompetitionMockAssignment)
+        .join(CompetitionMockExam, CompetitionMockAssignment.mock_exam_id == CompetitionMockExam.id)
+        .filter(
+            CompetitionMockAssignment.student_id == student.id,
+            CompetitionMockAssignment.is_active == True,
+            CompetitionMockExam.is_active == True,
+            CompetitionMockExam.status != "ARCHIVED",
+        )
+    )
+    if student.current_level_id:
+        query = query.filter(CompetitionMockExam.level_id == student.current_level_id)
+    rows = query.order_by(CompetitionMockAssignment.assigned_at.desc()).all()
+    return [_assignment_with_current_attempt_payload(db, row) for row in rows]
+
+
+def StartCompetitionMockAttempt(db: Session, student: Student, assignment_id: str) -> dict[str, Any]:
+    assignment = db.get(CompetitionMockAssignment, assignment_id)
+    if not assignment or assignment.student_id != student.id or not assignment.is_active:
+        api_error(404, "COMPETITION_ASSIGNMENT_NOT_FOUND", "Competition mock assignment not found.")
+    exam = db.get(CompetitionMockExam, assignment.mock_exam_id)
+    if not exam or not exam.is_active or exam.status == "ARCHIVED":
+        api_error(404, "COMPETITION_MOCK_NOT_AVAILABLE", "Competition mock is not available.")
+    if student.current_level_id and exam.level_id != student.current_level_id:
+        api_error(403, "WRONG_LEVEL_COMPETITION_MOCK", "This mock is not assigned for your current level.")
+
+    active_attempt = (
+        db.query(CompetitionMockAttempt)
+        .filter(
+            CompetitionMockAttempt.mock_assignment_id == assignment.id,
+            CompetitionMockAttempt.student_id == student.id,
+            CompetitionMockAttempt.status == ACTIVE_STATUS,
+        )
+        .order_by(CompetitionMockAttempt.started_at.desc())
+        .first()
+    )
+    if active_attempt:
+        active_attempt = EnsureCompetitionAttemptActiveOrSubmit(db, active_attempt)
+        if active_attempt.status == ACTIVE_STATUS:
+            return _attempt_payload(db, active_attempt)
+
+    completed_count = (
+        db.query(CompetitionMockAttempt)
+        .filter(
+            CompetitionMockAttempt.mock_assignment_id == assignment.id,
+            CompetitionMockAttempt.student_id == student.id,
+            CompetitionMockAttempt.status.in_(list(COMPLETED_STATUSES)),
+        )
+        .count()
+    )
+    if completed_count >= max(1, assignment.max_attempts or 1):
+        api_error(403, "COMPETITION_ATTEMPTS_EXHAUSTED", "This mock exam has already been submitted.")
+
+    questions_count = db.query(CompetitionMockQuestion).filter(CompetitionMockQuestion.mock_exam_id == exam.id).count()
+    if questions_count <= 0:
+        api_error(400, "COMPETITION_MOCK_EMPTY", "This mock exam has no questions.")
+
+    started_at = _now_utc()
+    attempt = CompetitionMockAttempt(
+        mock_assignment_id=assignment.id,
+        mock_exam_id=exam.id,
+        student_id=student.id,
+        attempt_number=(assignment.current_attempt_number or 0) + 1,
+        status=ACTIVE_STATUS,
+        started_at=started_at,
+        expires_at=started_at + timedelta(seconds=exam.duration_seconds),
+        duration_seconds=exam.duration_seconds,
+        total_questions=questions_count,
+        max_score=float(exam.total_marks or questions_count),
+    )
+    assignment.current_attempt_number = attempt.attempt_number
+    assignment.status = "IN_PROGRESS"
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    return _attempt_payload(db, attempt)
+
+
+def EnsureCompetitionAttemptActiveOrSubmit(db: Session, attempt: CompetitionMockAttempt) -> CompetitionMockAttempt:
+    if attempt.status in COMPLETED_STATUSES:
+        return attempt
+    if _remaining_seconds(attempt) <= 0:
+        return SubmitCompetitionMockAttempt(db, attempt, auto=True)
+    return attempt
+
+
+def GetCompetitionMockAttemptForStudent(db: Session, student: Student, attempt_id: str) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt or attempt.student_id != student.id:
+        api_error(404, "COMPETITION_ATTEMPT_NOT_FOUND", "Competition mock attempt not found.")
+    attempt = EnsureCompetitionAttemptActiveOrSubmit(db, attempt)
+    if attempt.status != ACTIVE_STATUS:
+        return {
+            "attemptId": attempt.id,
+            "status": attempt.status,
+            "message": "Competition mock has already been submitted.",
+            "resultAvailable": True,
+        }
+    return _attempt_payload(db, attempt)
+
+
+def SaveCompetitionMockAnswer(db: Session, student: Student, attempt_id: str, question_id: str, selected_option_id: str) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt or attempt.student_id != student.id:
+        api_error(404, "COMPETITION_ATTEMPT_NOT_FOUND", "Competition mock attempt not found.")
+    attempt = EnsureCompetitionAttemptActiveOrSubmit(db, attempt)
+    if attempt.status != ACTIVE_STATUS:
+        # If this save call is the one that tipped the attempt into a lazy
+        # auto-submit (timer already expired server-side), the completion
+        # side-effects (badges/XP/coins) ran inside EnsureCompetitionAttemptActiveOrSubmit
+        # just above and are attached in-memory on `attempt` -- surface them
+        # here the same way SubmitCompetitionMockAttemptForStudent() does, so
+        # the frontend's badge-reveal handoff works from this path too, not
+        # just the two explicit submit endpoints.
+        side_effects = getattr(attempt, "_side_effects_result", None) or {}
+        return {
+            "saved": False,
+            "status": attempt.status,
+            "message": "Competition mock is no longer active.",
+            "resultAvailable": True,
+            "unlockedBadges": side_effects.get("unlockedBadges", []),
+            "rankedUp": side_effects.get("rankedUp", False),
+            "newRankTier": side_effects.get("newRankTier"),
+        }
+
+    question = db.get(CompetitionMockQuestion, question_id)
+    if not question or question.mock_exam_id != attempt.mock_exam_id:
+        api_error(400, "INVALID_COMPETITION_QUESTION", "Question does not belong to this mock attempt.")
+    option = db.get(CompetitionMockQuestionOption, selected_option_id)
+    if not option or option.mock_question_id != question.id:
+        api_error(400, "INVALID_COMPETITION_OPTION", "Option does not belong to this question.")
+
+    answer = (
+        db.query(CompetitionMockAttemptAnswer)
+        .filter(
+            CompetitionMockAttemptAnswer.mock_attempt_id == attempt.id,
+            CompetitionMockAttemptAnswer.mock_question_id == question.id,
+        )
+        .first()
+    )
+    if not answer:
+        answer = CompetitionMockAttemptAnswer(mock_attempt_id=attempt.id, mock_question_id=question.id)
+        db.add(answer)
+    answer.selected_option_id = option.id
+    answer.selected_value = option.option_value
+    answer.is_correct = bool(option.is_correct)
+    answer.marks_awarded = float(question.marks or 1) if option.is_correct else 0.0
+    db.commit()
+
+    answered_count = (
+        db.query(CompetitionMockAttemptAnswer)
+        .filter(CompetitionMockAttemptAnswer.mock_attempt_id == attempt.id, CompetitionMockAttemptAnswer.selected_option_id.isnot(None))
+        .count()
+    )
+    return {
+        "saved": True,
+        "attemptId": attempt.id,
+        "questionId": question.id,
+        "selectedOptionId": option.id,
+        "answeredCount": answered_count,
+        "remainingSeconds": _remaining_seconds(attempt),
+    }
+
+
+def _format_concept_family(concept: str | None) -> str:
+    if not concept or concept == "MM_UNSUPPORTED":
+        return "Mixed Concepts"
+    if concept == "BODMAS":
+        return "BODMAS"
+    if concept == "ADD_LESS":
+        return "Add/Less"
+    if concept == "DECIMAL_ADD_LESS":
+        return "Decimal Add/Less"
+    if concept == "PERCENTAGE_ADD_LESS":
+        return "Percentage Add/Less"
+
+    words = concept.replace("_", " ").split()
+    return " ".join(word.capitalize() for word in words)
+
+
+def SubmitCompetitionMockAttempt(db: Session, attempt: CompetitionMockAttempt, auto: bool = False) -> CompetitionMockAttempt:
+    if attempt.status in COMPLETED_STATUSES:
+        return attempt
+
+    questions = (
+        db.query(CompetitionMockQuestion)
+        .filter(CompetitionMockQuestion.mock_exam_id == attempt.mock_exam_id)
+        .order_by(CompetitionMockQuestion.question_number.asc())
+        .all()
+    )
+    answers = {
+        answer.mock_question_id: answer
+        for answer in db.query(CompetitionMockAttemptAnswer).filter(CompetitionMockAttemptAnswer.mock_attempt_id == attempt.id).all()
+    }
+    correct = wrong = unanswered = 0
+    score = 0.0
+    max_score = 0.0
+    concept_totals: dict[str, dict[str, float]] = {}
+
+    for question in questions:
+        max_score += float(question.marks or 1)
+
+        # Group by the individual, student-recognizable concept (2026-07-19,
+        # Shailesh) -- e.g. "BODMAS", "2D × 2D Multiplication", "Add
+        # Percentage" -- not the much broader section title. A student needs
+        # to see exactly which specific concept they're weak in without
+        # having to review every question; collapsing an entire section (up
+        # to 6 real concepts) into one bucket hid that detail. The only
+        # cleanup applied is _canonical_competition_concept_name()'s small
+        # override map, which folds a few synthetic multi-label generator
+        # names (e.g. "BODMAS Competition Challenge" and "BODMAS Square Root
+        # Decimal Percentage Challenge") down to the one real concept name --
+        # every other concept_tag is already a real, individually distinct
+        # DPS-recognized concept and stays separate.
+        concept_key = _canonical_competition_concept_name(question)
+
+        concept_totals.setdefault(concept_key, {"correct": 0, "total": 0})
+        concept_totals[concept_key]["total"] += 1
+        answer = answers.get(question.id)
+        if not answer or not answer.selected_option_id:
+            unanswered += 1
+            continue
+        option = db.get(CompetitionMockQuestionOption, answer.selected_option_id)
+        if option and option.is_correct:
+            correct += 1
+            concept_totals[concept_key]["correct"] += 1
+            answer.is_correct = True
+            answer.marks_awarded = float(question.marks or 1)
+            score += answer.marks_awarded
+        else:
+            wrong += 1
+            answer.is_correct = False
+            answer.marks_awarded = 0.0
+
+    now = _now_utc()
+    if auto:
+        # AUTO_SUBMITTED means the timer ran out; the true end-of-exam
+        # moment is started_at + duration_seconds, not whenever this code
+        # happens to run (a lazy GET, a background job, or the defensive
+        # result-page repair can all detect the expiry minutes or hours
+        # late). Stamping submitted_at with "now" mis-timed every
+        # auto-submitted attempt and could shift it into the wrong day for
+        # streak/heatmap bucketing (see recalculate_streaks.py, which sorts
+        # on this column). Falls back to "now" only if started_at is
+        # missing, and is never allowed to land in the future (clock-skew
+        # guard).
+        started = _aware(attempt.started_at)
+        submitted_at = min(started + timedelta(seconds=attempt.duration_seconds or 0), now) if started else now
+    else:
+        submitted_at = now
+    attempt.status = "AUTO_SUBMITTED" if auto else "SUBMITTED"
+    attempt.submitted_at = submitted_at
+    attempt.correct_count = correct
+    attempt.wrong_count = wrong
+    attempt.unanswered_count = unanswered
+    attempt.attempted_count = correct + wrong
+    attempt.total_questions = len(questions)
+    attempt.total_score = round(score)
+    attempt.max_score = round(max_score)
+    attempt.percentage = round((score / max_score) * 100) if max_score else 0.0
+    attempt.performance_band = _performance_band(attempt.percentage)
+    attempt.time_taken_seconds = attempt.duration_seconds if auto else _duration_seconds(attempt.started_at, submitted_at, attempt.duration_seconds)
+    attempt.time_utilization_percentage = round(((attempt.time_taken_seconds or 0) / attempt.duration_seconds) * 100) if attempt.duration_seconds else None
+
+    assignment = db.get(CompetitionMockAssignment, attempt.mock_assignment_id)
+    if assignment:
+        assignment.status = "COMPLETED"
+
+    concept_performance = []
+    strengths = []
+    weaknesses = []
+    for concept, item in concept_totals.items():
+        total = int(item["total"])
+        correct_value = int(item["correct"])
+        percentage = round((correct_value / total) * 100) if total else 0.0
+        concept_payload = {"concept": concept, "correct": correct_value, "total": total, "percentage": percentage}
+        concept_performance.append(concept_payload)
+        # Same single 70% cutoff as _section_performance_from_review() above
+        # -- see that function's comment for why >=75/<60 was wrong.
+        if percentage >= 70:
+            strengths.append(concept_payload)
+        else:
+            weaknesses.append(concept_payload)
+
+    existing_summary = (
+        db.query(CompetitionMockResultSummary)
+        .filter(CompetitionMockResultSummary.mock_attempt_id == attempt.id)
+        .first()
+    )
+    if not existing_summary:
+        existing_summary = CompetitionMockResultSummary(
+            mock_attempt_id=attempt.id,
+            mock_assignment_id=attempt.mock_assignment_id,
+            mock_exam_id=attempt.mock_exam_id,
+            student_id=attempt.student_id,
+        )
+        db.add(existing_summary)
+    existing_summary.score = attempt.total_score
+    existing_summary.max_score = attempt.max_score
+    existing_summary.percentage = attempt.percentage
+    total = attempt.total_questions if attempt.total_questions > 0 else (attempt.attempted_count + attempt.unanswered_count)
+    if not total: total = 100
+    existing_summary.accuracy_percentage = round((correct / total) * 100)
+    existing_summary.time_taken_seconds = attempt.time_taken_seconds
+    existing_summary.time_utilization_percentage = attempt.time_utilization_percentage
+    existing_summary.performance_band = attempt.performance_band or _performance_band(attempt.percentage)
+    existing_summary.concept_strengths_json = json.dumps(strengths)
+    existing_summary.concept_weaknesses_json = json.dumps(weaknesses)
+    existing_summary.concept_performance_json = json.dumps(concept_performance)
+    existing_summary.recommendation_json = json.dumps({"message": "Review weak areas and retry similar practice before the next mock."})
+    existing_summary.completed_at = submitted_at
+    db.commit()
+    db.refresh(attempt)
+
+    # Run the completion side-effects (student/teacher/admin notifications,
+    # XP + coin award, badge evaluation) exactly once, from this single
+    # grading function, regardless of which caller first completes the
+    # attempt -- a manual submit, an explicit auto-submit, a lazy auto-submit
+    # triggered by a plain GET after the timer already expired server-side,
+    # or the defensive result-page repair further down in this file. Prior to
+    # this, those side-effects only ran from SubmitCompetitionMockAttemptForStudent(),
+    # so any attempt that got graded via one of the other paths silently
+    # never received them. See gamification_processed_at on the model /
+    # its migration for the idempotency guard that makes this safe to call
+    # from anywhere.
+    attempt._side_effects_result = _ProcessMockCompletionSideEffects(db, attempt)
+
+    return attempt
+
+
+def _ProcessMockCompletionSideEffects(db: Session, attempt: CompetitionMockAttempt) -> dict[str, Any] | None:
+    """Notifications + XP/coins + badge evaluation for a just-completed mock attempt.
+
+    Safe to call from any code path that just completed an attempt: it
+    atomically claims the attempt via gamification_processed_at before doing
+    any work, so if two requests somehow race to complete the same attempt,
+    only one of them actually runs this. Returns None if some other request
+    already claimed it (nothing new happened this call), otherwise a dict
+    describing what was awarded so the caller can surface it immediately.
+    """
+    from sqlalchemy import update as _sa_update
+
+    claim = db.execute(
+        _sa_update(CompetitionMockAttempt)
+        .where(
+            CompetitionMockAttempt.id == attempt.id,
+            CompetitionMockAttempt.gamification_processed_at.is_(None),
+        )
+        .values(gamification_processed_at=_now_utc())
+    )
+    db.commit()
+    if claim.rowcount == 0:
+        return None
+
+    student = db.get(Student, attempt.student_id)
+    if not student:
+        return None
+
+    exam = db.get(CompetitionMockExam, attempt.mock_exam_id)
+    module = db.get(Module, exam.module_id) if exam else None
+    level = db.get(Level, exam.level_id) if exam else None
+    assignment = db.get(CompetitionMockAssignment, attempt.mock_assignment_id)
+
+    if exam and assignment:
+        student_user = db.get(User, student.user_id)
+        if student_user:
+            try:
+                safe_teacher_id = student.teacher_id if student.teacher_id else None
+
+                # Notify Student
+                CreateNotification(
+                    db,
+                    recipient_user_id=student_user.id,
+                    recipient_role="STUDENT",
+                    type="MOCK_SUBMITTED",
+                    category="COMPETITION_MOCK",
+                    title="Mock Exam Submitted",
+                    message=f"You successfully submitted {exam.title or exam.mock_code}. Score: {int(round(attempt.total_score or 0))}/{int(round(attempt.max_score or 0))} ({int(round(attempt.percentage or 0))}%)",
+                    actor_user_id=student_user.id,
+                    actor_role="STUDENT",
+                    student_id=student.id,
+                    teacher_id=safe_teacher_id,
+                    attempt_id=attempt.id,
+                    color_variant="indigo",
+                    metadata={
+                        "event": "MOCK_SUBMITTED",
+                        "moduleCode": module.module_code if module else None,
+                        "levelCode": level.level_code if level else None,
+                    }
+                )
+
+                teacher_name = "No Teacher"
+                if safe_teacher_id:
+                    teacher_record = db.get(Teacher, safe_teacher_id)
+                    teacher_user = db.get(User, teacher_record.user_id) if teacher_record else None
+                    if teacher_user and teacher_record:
+                        teacher_name = teacher_user.full_name
+                        CreateNotification(
+                            db,
+                            recipient_user_id=teacher_user.id,
+                            recipient_role="TEACHER",
+                            type="STUDENT_MOCK_SUBMITTED",
+                            category="COMPETITION_MOCK",
+                            title="Student Mock Submitted",
+                            message=f"{student_user.full_name} submitted {exam.title or exam.mock_code}. Score: {int(round(attempt.total_score or 0))}/{int(round(attempt.max_score or 0))} ({int(round(attempt.percentage or 0))}%)",
+                            actor_user_id=student_user.id,
+                            actor_role="STUDENT",
+                            student_id=student.id,
+                            teacher_id=safe_teacher_id,
+                            attempt_id=attempt.id,
+                            color_variant="purple",
+                            metadata={
+                                "event": "STUDENT_MOCK_SUBMITTED",
+                                "moduleCode": module.module_code if module else None,
+                                "levelCode": level.level_code if level else None,
+                            }
+                        )
+
+                admins = db.query(User).filter(User.role.in_(["ADMIN", "SUPER_ADMIN"]), User.is_active == True).all()
+
+                for admin in admins:
+                    CreateNotification(
+                        db,
+                        recipient_user_id=admin.id,
+                        recipient_role="ADMIN",
+                        type="STUDENT_MOCK_SUBMITTED",
+                        category="COMPETITION_MOCK",
+                        title="Student Mock Submitted",
+                        message=f"{student_user.full_name} (Teacher: {teacher_name}) submitted {exam.title or exam.mock_code}. Score: {int(round(attempt.total_score or 0))}/{int(round(attempt.max_score or 0))} ({int(round(attempt.percentage or 0))}%)",
+                        actor_user_id=student_user.id,
+                        actor_role="STUDENT",
+                        student_id=student.id,
+                        teacher_id=safe_teacher_id,
+                        attempt_id=attempt.id,
+                        color_variant="indigo",
+                        metadata={
+                            "event": "STUDENT_MOCK_SUBMITTED",
+                            "moduleCode": module.module_code if module else None,
+                            "levelCode": level.level_code if level else None,
+                        }
+                    )
+
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                import logging
+                logging.error(f"Failed to generate notifications for mock submission {attempt.id}: {e}")
+
+    # --- Economy Hook ---
+    # Uses the same duration-based, activity-weighted formula shared with
+    # DPS and assessment completion (EconomyService.evaluate_activity_performance)
+    # instead of the old flat base_xp=500 -- see that function's docstring
+    # for why reward is now based on the mock's allotted duration_seconds
+    # rather than a fixed constant. For a typical 60-minute mock at the
+    # standard (50-75% accuracy) multiplier band, this lands at essentially
+    # the same payout as before, so no existing student's earned XP/coins
+    # trajectory changes; a mock configured with a different duration now
+    # pays proportionally instead of identically to every other mock.
+    final_xp = 0
+    final_coins = 0
+    ranked_up = False
+    new_rank_tier = None
+    try:
+        from app.services.economy_service import EconomyService
+        econ_result = EconomyService.evaluate_activity_performance(
+            db=db,
+            user_id=student.user_id,
+            accuracy_percent=attempt.percentage or 0.0,
+            activity_type="MOCK",
+            duration_seconds=attempt.duration_seconds,
+            reference_id=attempt.mock_assignment_id or "MOCK"
+        )
+        final_xp = econ_result.get("awarded_xp", 0)
+        final_coins = econ_result.get("awarded_coins", 0)
+        # ranked_up/new_rank come straight out of EconomyService.award_xp_and_coins,
+        # which already computes them off the real current_xp -> current_rank_tier
+        # transition for this exact award -- nothing new is derived or guessed
+        # here, this just carries the existing values through to the response so
+        # the frontend can fire RankCinematicOverlay automatically instead of it
+        # only ever being reachable from the manual "preview" roadmap click
+        # (2026-07-25 Round 1 fix).
+        ranked_up = bool(econ_result.get("ranked_up", False))
+        new_rank_tier = econ_result.get("new_rank") if ranked_up else None
+    except Exception as e:
+        import logging
+        logging.error(f"Economy engine failed for attempt {attempt.id}: {e}")
+
+    # --- Gamification Hook ---
+    unlocked_badges = []
+    try:
+        from app.services.achievements import AchievementEngine
+        from app.models.models import CompetitionMockResultSummary
+        # Eagerly load the mock assignment to prevent detached instance / lazy-load errors
+        from sqlalchemy.orm import joinedload
+        summary = db.query(CompetitionMockResultSummary).options(joinedload(CompetitionMockResultSummary.mock_assignment)).filter_by(mock_attempt_id=attempt.id).first()
+        if summary:
+            unlocked_badges = AchievementEngine.evaluate_mock_exam_submission(db, student.id, summary)
+
+            for b in unlocked_badges:
+                try:
+                    badge_id = b.get("id")
+                    code = b.get("code")
+                    tier = b.get("tier")
+                    name = b.get("name")
+                    description = b.get("description")
+                    icon_name = b.get("icon_name", "Target")
+                    CreateNotification(
+                        db,
+                        recipient_user_id=student.user_id,
+                        recipient_role="STUDENT",
+                        type="BADGE_UNLOCKED",
+                        category="GAMIFICATION",
+                        title=f"New Badge Unlocked: {name}",
+                        message=f"You unlocked the {tier} tier '{name}' badge for: {description}!",
+                        target_route=f"/student/achievements?badge={code}_{tier}",
+                        color_variant="PURPLE",
+                        metadata={"badgeId": badge_id, "tier": tier, "code": code, "icon": icon_name}
+                    )
+                    # CreateNotification() only db.add()s + db.flush()es -- it never
+                    # commits (by design, so callers can batch several notifications
+                    # into one transaction). Every OTHER notification/side-effect in
+                    # this function has its own explicit db.commit() (student/
+                    # teacher/admin block above, the gamification_processed_at claim,
+                    # AchievementEngine.evaluate_mock_exam_submission() internally),
+                    # but this badge-notification loop never did. Since neither
+                    # SubmitCompetitionMockAttemptForStudent() nor the route handler
+                    # that calls it commit afterward either, and get_db() closes the
+                    # session with no implicit commit, every badge-unlock notification
+                    # was silently created, flushed into the open transaction, then
+                    # discarded when the request ended -- the badge itself persisted
+                    # (evaluate_mock_exam_submission commits its own writes before
+                    # this loop even starts), so Trophy Room / the dashboard's
+                    # "Latest Unlock" widget showed it correctly, but the student
+                    # never got notified. Committing per-badge here (matching the
+                    # round-9 backfill script's pattern) is what actually persists it.
+                    db.commit()
+                except Exception as ne:
+                    db.rollback()
+                    import logging
+                    logging.error(f"Failed to create badge notification for {b.get('name')}: {ne}")
+
+    except Exception as e:
+        import logging
+        logging.error(f"Gamification engine failed for attempt {attempt.id}: {e}")
+
+    return {
+        "unlockedBadges": unlocked_badges,
+        "awardedXP": final_xp,
+        "awardedCoins": final_coins,
+        "rankedUp": ranked_up,
+        "newRankTier": new_rank_tier,
+    }
+
+
+def SubmitCompetitionMockAttemptForStudent(db: Session, student: Student, attempt_id: str, auto: bool = False) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt or attempt.student_id != student.id:
+        api_error(404, "COMPETITION_ATTEMPT_NOT_FOUND", "Competition mock attempt not found.")
+    attempt = SubmitCompetitionMockAttempt(db, attempt, auto=auto)
+
+    # If THIS request is the one that completed the attempt, the result of
+    # _ProcessMockCompletionSideEffects is attached in-memory (see
+    # SubmitCompetitionMockAttempt above). If the attempt was already
+    # completed by an earlier request -- e.g. the timer expired and a lazy
+    # auto-submit beat this call to the server -- side_effects will be None
+    # here. That's expected, not an error: the student/teacher/admin
+    # notifications and XP/coins were already awarded the moment it first
+    # completed, this request just didn't happen to be the one that did it.
+    side_effects = getattr(attempt, "_side_effects_result", None) or {}
+
+    return {
+        "attemptId": attempt.id,
+        "status": attempt.status,
+        "score": attempt.total_score,
+        "maxScore": attempt.max_score,
+        "percentage": attempt.percentage,
+        "correct": attempt.correct_count,
+        "wrong": attempt.wrong_count,
+        "unanswered": attempt.unanswered_count,
+        "timeTakenSeconds": attempt.time_taken_seconds,
+        "unlockedBadges": side_effects.get("unlockedBadges", []),
+        "awardedXP": side_effects.get("awardedXP", 0),
+        "awardedCoins": side_effects.get("awardedCoins", 0),
+        "rankedUp": side_effects.get("rankedUp", False),
+        "newRankTier": side_effects.get("newRankTier"),
+    }
+
+
+def _question_review_payload(db: Session, attempt: CompetitionMockAttempt) -> list[dict[str, Any]]:
+    questions = (
+        db.query(CompetitionMockQuestion)
+        .filter(CompetitionMockQuestion.mock_exam_id == attempt.mock_exam_id)
+        .order_by(CompetitionMockQuestion.question_number.asc())
+        .all()
+    )
+    if not questions:
+        return []
+
+    question_ids = [question.id for question in questions]
+    option_rows = (
+        db.query(CompetitionMockQuestionOption)
+        .filter(CompetitionMockQuestionOption.mock_question_id.in_(question_ids))
+        .order_by(CompetitionMockQuestionOption.display_order.asc())
+        .all()
+    )
+    options_by_question: dict[str, list[CompetitionMockQuestionOption]] = {}
+    options_by_id: dict[str, CompetitionMockQuestionOption] = {}
+    for option in option_rows:
+        options_by_question.setdefault(option.mock_question_id, []).append(option)
+        options_by_id[option.id] = option
+
+    answer_rows = (
+        db.query(CompetitionMockAttemptAnswer)
+        .filter(CompetitionMockAttemptAnswer.mock_attempt_id == attempt.id)
+        .all()
+    )
+    answers_by_question = {answer.mock_question_id: answer for answer in answer_rows}
+
+    review: list[dict[str, Any]] = []
+    for question in questions:
+        section_title = _competition_section_title(question)
+        concept_name = _canonical_competition_concept_name(question)
+        metadata = _json_loads(question.metadata_json, {})
+        metadata.update({
+            "section_number": question.section_number,
+            "section_title": section_title,
+            "sectionTitle": section_title,
+            "concept_family": question.concept_family,
+            "concept_tag": question.concept_tag,
+            "mock_mode": "COMPETITION_MOCK",
+        })
+        options = options_by_question.get(question.id, [])
+        correct_option = next((option for option in options if option.is_correct), None)
+        answer = answers_by_question.get(question.id)
+        selected_option = options_by_id.get(answer.selected_option_id) if answer and answer.selected_option_id else None
+
+        review.append({
+            "questionId": question.id,
+            "questionNumber": question.question_number,
+            "sectionNumber": question.section_number,
+            "sectionTitle": section_title,
+            "concept": concept_name,
+            "displayType": question.display_type,
+            "questionText": question.question_text,
+            "operands": _json_loads(question.operands_json, []),
+            "operators": _json_loads(question.operators_json, []),
+            "metadata": metadata,
+            "options": [
+                {
+                    "optionId": option.id,
+                    "label": option.option_label,
+                    "value": option.option_value,
+                    "isCorrect": bool(option.is_correct),
+                }
+                for option in options
+            ],
+            "selectedOption": (
+                {
+                    "optionId": selected_option.id,
+                    "label": selected_option.option_label,
+                    "value": selected_option.option_value,
+                }
+                if selected_option else None
+            ),
+            "correctOption": (
+                {
+                    "optionId": correct_option.id,
+                    "label": correct_option.option_label,
+                    "value": correct_option.option_value,
+                }
+                if correct_option else None
+            ),
+            "isCorrect": bool(answer.is_correct) if answer and answer.selected_option_id else False,
+            "isUnanswered": not bool(answer and answer.selected_option_id),
+            "marksAwarded": float(answer.marks_awarded or 0) if answer else 0.0,
+            "marks": float(question.marks or 1),
+        })
+    return review
+
+def _apply_section_display_numbers(review: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Renumbers each review row's sectionNumber (and the mirrored
+    metadata.section_number) to a gap-free 1..N display sequence, for
+    frontend display only — matches the same renumbering shown on the
+    pre-exam instructions page and the live attempt page.
+
+    Must run AFTER _section_performance_from_review, since that function's
+    MM_COMPETITION_SECTION_TITLES lookup depends on the real section
+    number, not display position.
+    """
+    if not review:
+        return review
+    display_map = _section_display_number_map(item.get("sectionNumber") for item in review)
+    renumbered: list[dict[str, Any]] = []
+    for item in review:
+        try:
+            real_number = int(item.get("sectionNumber") or 0)
+        except Exception:
+            real_number = 0
+        display_number = display_map.get(real_number, real_number)
+        new_item = dict(item)
+        new_item["sectionNumber"] = display_number
+        if isinstance(new_item.get("metadata"), dict):
+            new_metadata = dict(new_item["metadata"])
+            new_metadata["section_number"] = display_number
+            new_item["metadata"] = new_metadata
+        renumbered.append(new_item)
+    return renumbered
+
+
+CONCEPT_HIGHLIGHT_LIMIT = 5
+
+
+def _top_concept_highlights(items: list[dict[str, Any]], *, worst_first: bool) -> list[dict[str, Any]]:
+    """Caps the per-mock Result page's Strengths/Weak Areas cards to the
+    CONCEPT_HIGHLIGHT_LIMIT most notable individual concepts (2026-07-19,
+    Shailesh). "Section Performance" (conceptPerformance, built from the same
+    section_strengths/section_weaknesses source but never passed through
+    this function) already lists every concept in the mock exhaustively and
+    is the working reference a student clicks through to review the exact
+    questions -- Strengths/Weak Areas sitting right below it used to just
+    repeat that entire list two more times (split by threshold), which for a
+    100-200 question mock meant scrolling past the same ~50 concepts three
+    times over. This keeps Strengths/Weak Areas as a fast, honest highlight
+    (best 5 / worst 5) instead. Full, uncapped concept detail is still the
+    right thing to show on the aggregate Mock Performance Insights tab
+    (GetCompetitionMockProgressInsightsForStudent) -- that function does not
+    call this helper and is unaffected.
+    """
+    return sorted(items, key=lambda item: item.get("percentage", 0), reverse=not worst_first)[:CONCEPT_HIGHLIGHT_LIMIT]
+
+
+def _result_payload(db: Session, attempt: CompetitionMockAttempt) -> dict[str, Any]:
+    assignment = db.get(CompetitionMockAssignment, attempt.mock_assignment_id)
+    exam = db.get(CompetitionMockExam, attempt.mock_exam_id)
+    if not assignment or not exam:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result could not be loaded.")
+
+    if attempt.status not in COMPLETED_STATUSES:
+        api_error(409, "COMPETITION_ATTEMPT_NOT_SUBMITTED", "Submit the mock before viewing the result.")
+
+    summary = (
+        db.query(CompetitionMockResultSummary)
+        .filter(CompetitionMockResultSummary.mock_attempt_id == attempt.id)
+        .first()
+    )
+    if not summary:
+        # Defensive repair for already-submitted attempts where summary creation did not run.
+        attempt = SubmitCompetitionMockAttempt(db, attempt, auto=attempt.status == "AUTO_SUBMITTED")
+        summary = (
+            db.query(CompetitionMockResultSummary)
+            .filter(CompetitionMockResultSummary.mock_attempt_id == attempt.id)
+            .first()
+        )
+    if not summary:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result summary is not available.")
+
+    level_record = db.get(Level, exam.level_id)
+    module_record = db.get(Module, exam.module_id)
+    question_review = _question_review_payload(db, attempt)
+    section_performance, section_strengths, section_weaknesses = _section_performance_from_review(question_review)
+    # Renumber sectionNumber for display only, after the concept-performance
+    # grouping above (which needs the real, fixed 1-10 section number to
+    # look up MM_COMPETITION_SECTION_TITLES correctly).
+    question_review = _apply_section_display_numbers(question_review)
+
+    return {
+        "attemptId": attempt.id,
+        "studentId": attempt.student_id,
+        "assignmentId": assignment.id,
+        "mockExamId": exam.id,
+        "status": attempt.status,
+        "score": summary.score,
+        "maxScore": summary.max_score,
+        "percentage": summary.percentage,
+        "accuracyPercentage": summary.accuracy_percentage,
+        "correct": attempt.correct_count,
+        "wrong": attempt.wrong_count,
+        "unanswered": attempt.unanswered_count,
+        "attempted": attempt.attempted_count,
+        "totalQuestions": attempt.total_questions,
+        "timeTakenSeconds": summary.time_taken_seconds,
+        "timeUtilizationPercentage": summary.time_utilization_percentage,
+        "performanceBand": summary.performance_band,
+        "completedAt": summary.completed_at.isoformat() if summary.completed_at else None,
+        "submittedAt": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        "conceptPerformance": section_performance or _json_loads(summary.concept_performance_json, []),
+        "conceptStrengths": _top_concept_highlights(section_strengths or _json_loads(summary.concept_strengths_json, []), worst_first=False),
+        "conceptWeaknesses": _top_concept_highlights(section_weaknesses or _json_loads(summary.concept_weaknesses_json, []), worst_first=True),
+        "recommendation": _json_loads(summary.recommendation_json, {}),
+        "questionReview": question_review,
+        "mockExam": {
+            "title": exam.title,
+            "mockCode": exam.mock_code,
+            "totalQuestions": exam.total_questions,
+            "totalMarks": exam.total_marks,
+            "marksPerQuestion": exam.marks_per_question,
+            "durationSeconds": exam.duration_seconds,
+            "moduleCode": module_record.module_code if module_record else None,
+            "moduleName": module_record.module_name if module_record else None,
+            "levelCode": level_record.level_code if level_record else None,
+            "levelName": level_record.level_name if level_record else None,
+        },
+    }
+
+
+def GetCompetitionMockResultForStudent(db: Session, student: Student, attempt_id: str) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt or attempt.student_id != student.id:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result not found.")
+    attempt = EnsureCompetitionAttemptActiveOrSubmit(db, attempt)
+    return _result_payload(db, attempt)
+
+
+def GetCompetitionMockResultForTeacher(db: Session, teacher: Teacher, attempt_id: str) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result not found.")
+
+    student = db.get(Student, attempt.student_id) if attempt.student_id else None
+    if not student or not getattr(student, "is_active", True):
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result not found.")
+
+    teacher_name = ""
+    if getattr(teacher, "user_id", None):
+        teacher_user = db.get(User, teacher.user_id)
+        teacher_name = teacher_user.full_name if teacher_user else ""
+
+    linked_by_id = bool(getattr(student, "teacher_id", None) and student.teacher_id == teacher.id)
+    linked_by_name = bool(teacher_name and getattr(student, "teacher", None) == teacher_name)
+    if not linked_by_id and not linked_by_name:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result not found.")
+
+    attempt = EnsureCompetitionAttemptActiveOrSubmit(db, attempt)
+    return _result_payload(db, attempt)
+
+
+def GetCompetitionMockResultForAdmin(db: Session, attempt_id: str) -> dict[str, Any]:
+    attempt = db.get(CompetitionMockAttempt, attempt_id)
+    if not attempt:
+        api_error(404, "COMPETITION_RESULT_NOT_FOUND", "Competition mock result not found.")
+    attempt = EnsureCompetitionAttemptActiveOrSubmit(db, attempt)
+    return _result_payload(db, attempt)
+
+
+def GetCompetitionMockProgressInsightsForStudent(db: Session, student: Student) -> dict[str, Any]:
+    from collections import defaultdict
+    import json
+    from sqlalchemy.orm import joinedload
+    from app.models.models import CompetitionMockResultSummary, CompetitionMockExam, CompetitionMockAttempt, CompetitionMockAssignment
+
+    summaries = (
+        db.query(CompetitionMockResultSummary)
+        .join(CompetitionMockAttempt, CompetitionMockResultSummary.mock_attempt_id == CompetitionMockAttempt.id)
+        .join(CompetitionMockAssignment, CompetitionMockAttempt.mock_assignment_id == CompetitionMockAssignment.id)
+        .filter(
+            CompetitionMockResultSummary.student_id == student.id,
+            CompetitionMockAssignment.is_active == True
+        )
+        .options(
+            joinedload(CompetitionMockResultSummary.mock_exam).joinedload(CompetitionMockExam.module),
+            joinedload(CompetitionMockResultSummary.mock_exam).joinedload(CompetitionMockExam.level),
+            joinedload(CompetitionMockResultSummary.mock_attempt)
+        )
+        .order_by(CompetitionMockResultSummary.completed_at.asc())
+        .all()
+    )
+
+    if not summaries:
+        return {
+            "overallScore": 0,
+            "overallAccuracy": 0,
+            "overallTimeUtilization": 0,
+            "totalMocksAttempted": 0,
+            "averageTimePerQuestion": 0,
+            "history": [],
+            "moduleInsights": []
+        }
+
+    total_score_earned = 0
+    total_max_score = 0
+    total_correct = 0
+    total_questions_all = 0
+    total_time_utilization = 0
+    total_time_taken = 0
+    total_questions = 0
+
+    history = []
+
+    # Structure: module_level_key -> concept -> stats
+    # module_level_key = (module.id, level.id, module.module_code, level.level_code, module.module_name, level.level_name)
+    concept_stats_by_level = defaultdict(lambda: defaultdict(lambda: {"correct": 0, "total": 0, "time_taken": 0}))
+
+    for s in summaries:
+        history.append({
+            "mockExamId": s.mock_exam_id,
+            "completedAt": s.completed_at.isoformat() if s.completed_at else None,
+            "score": s.score,
+            "accuracyPercentage": s.accuracy_percentage,
+            "timeUtilizationPercentage": s.time_utilization_percentage,
+            "timeTakenSeconds": s.time_taken_seconds
+        })
+
+        total_score_earned += (s.score or 0)
+        total_max_score += (s.max_score or 0)
+        
+        if s.mock_attempt:
+            total_correct += (s.mock_attempt.correct_count or 0)
+            t_qs = s.mock_attempt.total_questions
+            if not t_qs:
+                t_qs = (s.mock_attempt.attempted_count or 0) + (s.mock_attempt.unanswered_count or 0)
+            total_questions_all += t_qs
+
+        if s.time_utilization_percentage:
+            total_time_utilization += s.time_utilization_percentage
+
+        if s.time_taken_seconds:
+            total_time_taken += s.time_taken_seconds
+
+        module = s.mock_exam.module
+        level = s.mock_exam.level
+        level_key = (module.id, level.id, module.module_code, level.level_code, module.module_name, level.level_name)
+
+        if s.concept_performance_json:
+            try:
+                perfs = json.loads(s.concept_performance_json)
+                for p in perfs:
+                    concept = p.get("concept", "Unknown")
+                    concept_stats_by_level[level_key][concept]["correct"] += p.get("correct", 0)
+                    concept_stats_by_level[level_key][concept]["total"] += p.get("total", 0)
+                    concept_stats_by_level[level_key][concept]["time_taken"] += p.get("time_taken", 0)
+                    total_questions += p.get("total", 0)
+            except:
+                pass
+
+    n = len(summaries)
+
+    module_insights = []
+
+    for level_key, concept_stats in concept_stats_by_level.items():
+        module_id, level_id, module_code, level_code, module_name, level_name = level_key
+        strong_concepts = []
+        weak_concepts = []
+
+        for concept, stats in concept_stats.items():
+            if stats["total"] > 0:
+                acc = (stats["correct"] / stats["total"]) * 100
+                time_per_q = stats["time_taken"] / stats["total"]
+
+                payload = {
+                    "concept": concept,
+                    "accuracy": acc,
+                    "totalQuestions": stats["total"],
+                    "timePerQuestion": time_per_q
+                }
+
+                if acc >= 70:
+                    strong_concepts.append(payload)
+                else:
+                    weak_concepts.append(payload)
+
+        strong_concepts.sort(key=lambda x: x["accuracy"], reverse=True)
+        weak_concepts.sort(key=lambda x: x["accuracy"])
+
+        module_insights.append({
+            "moduleId": module_id,
+            "moduleCode": module_code,
+            "moduleName": module_name,
+            "levelId": level_id,
+            "levelCode": level_code,
+            "levelName": level_name,
+            "strongConcepts": strong_concepts,
+            "weakConcepts": weak_concepts
+        })
+
+    # Sort by module code then level code
+    module_insights.sort(key=lambda x: (x["moduleCode"], x["levelCode"]))
+
+    return {
+        "overallScore": round((total_score_earned / total_max_score) * 100) if total_max_score > 0 else 0,
+        "overallAccuracy": round((total_correct / total_questions_all) * 100) if total_questions_all > 0 else 0,
+        "overallTimeUtilization": round(total_time_utilization / n) if n > 0 else 0,
+        "totalMocksAttempted": n,
+        "averageTimePerQuestion": round(total_time_taken / total_questions, 2) if total_questions > 0 else 0,
+        "history": history,
+        "moduleInsights": module_insights
+    }
+

@@ -1,0 +1,765 @@
+"use client";
+
+import { AppShell } from "@/components/common/AppShell";
+import { EmptyState } from "@/components/common/EmptyState";
+import { ErrorState } from "@/components/common/ErrorState";
+import { LoadingState } from "@/components/common/LoadingState";
+import { useProtectedPage } from "@/hooks/useProtectedPage";
+import { apiErrorMessage } from "@/lib/api";
+import { getTeacherCompetitionMockTracker, type TeacherCompetitionTrackerRow } from "@/lib/api/teacher";
+import { useQuery } from "@tanstack/react-query";
+import { BarChart3, ChevronDown, ChevronRight, Clock3, Eye, Search, ShieldCheck, Trophy, UsersRound } from "lucide-react";
+import { useMemo, useState, Suspense } from "react";
+import type { Dispatch, SetStateAction } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect } from "react";
+
+type StatusFilter = "ALL" | "COMPLETED" | "PENDING";
+
+type SortKey = "mock" | "mockCode" | "status" | "score" | "accuracy" | "timeTaken" | "assignedDate" | "completionDate";
+type SortDirection = "asc" | "desc";
+type SortState = { key: SortKey; direction: SortDirection } | null;
+
+const MockTableColumns: Array<{ label: string; key?: SortKey; className?: string }> = [
+  { label: "MOCK", key: "mock" },
+  { label: "MOCK CODE", key: "mockCode" },
+  { label: "STATUS", key: "status" },
+  { label: "SCORE", key: "score" },
+  { label: "ACCURACY", key: "accuracy" },
+  { label: "TIME TAKEN", key: "timeTaken" },
+  { label: "ASSIGNED DATE", key: "assignedDate" },
+  { label: "COMPLETION DATE", key: "completionDate" },
+  { label: "REVIEW" },
+];
+
+function FormatDate(Value?: string | null) {
+  if (!Value) return "-";
+  const DateValue = new Date(Value);
+  if (Number.isNaN(DateValue.getTime())) return "-";
+  return DateValue.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function StatusLabel(Status?: string | null) {
+  const Value = String(Status || "ASSIGNED").toUpperCase();
+  if (Value === "COMPLETED") return "Completed";
+  if (Value === "IN_PROGRESS") return "Pending";
+  return "Pending";
+}
+
+function StatusTone(Status?: string | null): "green" | "amber" {
+  const Value = String(Status || "ASSIGNED").toUpperCase();
+  if (Value === "COMPLETED") return "green";
+  return "amber";
+}
+
+function IsCompleted(Row: TeacherCompetitionTrackerRow) {
+  return String(Row.status || "ASSIGNED").toUpperCase() === "COMPLETED";
+}
+
+function PercentValue(Value?: number | null) {
+  return Value != null ? `${Value}%` : "-";
+}
+
+function AverageAccuracyValue(Rows: TeacherCompetitionTrackerRow[]) {
+  const CompletedRows = Rows.filter((Row) => IsCompleted(Row) && Row.accuracyPercentage != null);
+  if (CompletedRows.length === 0) return null;
+  let totalCorrect = 0;
+  let totalQ = 0;
+  CompletedRows.forEach((Row) => {
+    const anyR = Row as any;
+    if (anyR.mockExam?.totalQuestions !== undefined && anyR.correctCount !== undefined) {
+      const qs = anyR.mockExam.totalQuestions > 0 ? anyR.mockExam.totalQuestions : ((anyR.attemptedCount ?? 0) + (anyR.unansweredCount ?? 0));
+      if (qs > 0) {
+        totalCorrect += anyR.correctCount;
+        totalQ += qs;
+      }
+    } else {
+      totalCorrect += Number(anyR.accuracyPercentage || 0);
+      totalQ += 100;
+    }
+  });
+  if (totalQ === 0) return null;
+  return Math.round((totalCorrect / totalQ) * 100);
+}
+
+
+function AverageScoreValue(Rows: TeacherCompetitionTrackerRow[]) {
+  const CompletedRows = Rows.filter((Row) => IsCompleted(Row) && Row.score != null);
+  if (CompletedRows.length === 0) return 0;
+  let totalScore = 0;
+  let totalMax = 0;
+  CompletedRows.forEach((Row) => {
+    const anyR = Row as any;
+    const s = Number(anyR.score || 0);
+    const m = Number(anyR.maxScore || 0);
+    if (m > 0) {
+      totalScore += s;
+      totalMax += m;
+    }
+  });
+  if (totalMax === 0) return 0;
+  return Math.round((totalScore / totalMax) * 100);
+}
+
+function AverageOfStudentAccuracyValues(Rows: TeacherCompetitionTrackerRow[]) {
+  return AverageAccuracyValue(Rows) || 0;
+}
+
+import { Chip } from "@/components/common/DetailWorkspaceViews";
+
+function AccuracyBandTone(Value: number | null): "slate" | "green" | "red" | "amber" | "blue" | "cyan" | "purple" {
+  if (Value == null) return "slate";
+  if (Value < 60) return "red";
+  if (Value < 80) return "amber";
+  if (Value < 90) return "purple";
+  return "green";
+}
+
+function AverageAccuracyChip(Rows: TeacherCompetitionTrackerRow[]) {
+  const Value = AverageAccuracyValue(Rows);
+  return (
+    <Chip tone={AccuracyBandTone(Value)}>
+      Avg Accuracy {Value == null ? "-" : `${Value}%`}
+    </Chip>
+  );
+}
+
+function ScorePercentage(Row: TeacherCompetitionTrackerRow) {
+  if (!IsCompleted(Row) || Row.score == null || Row.maxScore == null || Number(Row.maxScore) === 0) return null;
+  return Math.round((Number(Row.score) / Number(Row.maxScore)) * 100);
+}
+
+function ScoreText(Row: TeacherCompetitionTrackerRow) {
+  if (!IsCompleted(Row) || Row.score == null || Row.maxScore == null) return "-";
+  return `${Row.score}/${Row.maxScore}`;
+}
+
+function ReviewButton({ Row }: { Row: TeacherCompetitionTrackerRow }) {
+  if (!Row.attemptId) {
+    return (
+      <Chip tone="amber">Pending</Chip>
+    );
+  }
+
+  return (
+    <span className="tc-dark-hover-control inline-flex items-center justify-center gap-2 rounded-2xl border border-[#7a1f58]/25 bg-white px-4 py-2 text-xs font-black text-[#7a1f58] transition group-hover:border-[#7a1f58] group-hover:bg-[#7a1f58] group-hover:text-white dark:border-rose-300/35 dark:bg-slate-950/40 dark:text-rose-100 dark:group-hover:border-rose-300 dark:group-hover:bg-rose-500/30 dark:group-hover:text-rose-50">
+      <Eye size={14} /> Review
+    </span>
+  );
+}
+
+function SafeModuleLabel(Row: TeacherCompetitionTrackerRow) {
+  return Row.mockExam.moduleCode || "Module";
+}
+
+function SafeLevelLabel(Row: TeacherCompetitionTrackerRow) {
+  return Row.mockExam.levelCode || "Level";
+}
+
+function ToggleExpanded(Setter: Dispatch<SetStateAction<Set<string>>>, Key: string) {
+  Setter((Previous) => {
+    const Next = new Set(Previous);
+    if (Next.has(Key)) {
+      Next.delete(Key);
+    } else {
+      Next.add(Key);
+    }
+    return Next;
+  });
+}
+
+
+function SortValue(Row: TeacherCompetitionTrackerRow, Key: SortKey): string | number {
+  if (Key === "mock") return Row.mockExam.title || "";
+  if (Key === "mockCode") return Row.mockExam.mockCode || "";
+  if (Key === "status") return IsCompleted(Row) ? 1 : 0;
+  if (Key === "score") return ScorePercentage(Row) ?? -1;
+  if (Key === "accuracy") return IsCompleted(Row) && Row.accuracyPercentage != null ? Number(Row.accuracyPercentage) : -1;
+  if (Key === "timeTaken") return IsCompleted(Row) && Row.timeTakenSeconds != null ? Number(Row.timeTakenSeconds) : -1;
+  if (Key === "assignedDate") {
+    const Time = Row.assignedAt ? new Date(Row.assignedAt).getTime() : 0;
+    return Number.isNaN(Time) ? 0 : Time;
+  }
+  if (Key === "completionDate") {
+    const Time = Row.submittedAt ? new Date(Row.submittedAt).getTime() : 0;
+    return Number.isNaN(Time) ? 0 : Time;
+  }
+  return "";
+}
+
+function ChronologicalSortValue(Row: TeacherCompetitionTrackerRow): number {
+  const AssignedTime = Row.assignedAt ? new Date(Row.assignedAt).getTime() : 0;
+  return Number.isNaN(AssignedTime) ? 0 : AssignedTime;
+}
+
+function SortRows(Rows: TeacherCompetitionTrackerRow[], Sort: SortState) {
+  const ChronologicalRows = [...Rows].sort((Left, Right) => {
+    const DateResult = ChronologicalSortValue(Left) - ChronologicalSortValue(Right);
+    if (DateResult !== 0) return DateResult;
+
+    const MockCodeResult = String(Left.mockExam.mockCode || "").localeCompare(String(Right.mockExam.mockCode || ""), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+    if (MockCodeResult !== 0) return MockCodeResult;
+
+    return String(Left.mockExam.title || "").localeCompare(String(Right.mockExam.title || ""), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  });
+
+  if (!Sort) return ChronologicalRows;
+
+  return ChronologicalRows.sort((Left, Right) => {
+    const LeftValue = SortValue(Left, Sort.key);
+    const RightValue = SortValue(Right, Sort.key);
+    let Result = 0;
+
+    if (typeof LeftValue === "number" && typeof RightValue === "number") {
+      Result = LeftValue - RightValue;
+    } else {
+      Result = String(LeftValue).localeCompare(String(RightValue), undefined, { numeric: true, sensitivity: "base" });
+    }
+
+    return Sort.direction === "asc" ? Result : -Result;
+  });
+}
+
+function NextSortState(Current: SortState, Key: SortKey): SortState {
+  if (!Current || Current.key !== Key) return { key: Key, direction: "asc" };
+  if (Current.direction === "asc") return { key: Key, direction: "desc" };
+  return null;
+}
+
+function SortIndicator({ Sort, ColumnKey }: { Sort: SortState; ColumnKey: SortKey }) {
+  if (!Sort || Sort.key !== ColumnKey) {
+    return <span className="math-tc-mock-header-sort-inactive">↕</span>;
+  }
+  return <span className="math-tc-mock-header-sort-active">{Sort.direction === "asc" ? "↑" : "↓"}</span>;
+}
+
+type MockLevelGroup = {
+  key: string;
+  label: string;
+  rows: TeacherCompetitionTrackerRow[];
+};
+
+type MockModuleGroup = {
+  key: string;
+  label: string;
+  levels: MockLevelGroup[];
+};
+
+type StudentMockGroup = {
+  key: string;
+  student: TeacherCompetitionTrackerRow["student"];
+  rows: TeacherCompetitionTrackerRow[];
+  modules: MockModuleGroup[];
+};
+
+function MetricCard({ Icon, Label, Value }: { Icon: typeof Trophy; Label: string; Value: string | number }) {
+  return (
+    <div className="math-teacher-light-metric-card group relative overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:shadow-xl rounded-[24px] border border-rose-200/70 bg-white/85 p-4 shadow-sm ring-1 ring-rose-100/80 dark:border-white/10 dark:bg-slate-950/75 dark:ring-white/10">
+      {/* Gamified hover shine */}
+      <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/40 to-transparent opacity-0 transition-all duration-700 group-hover:translate-x-full group-hover:opacity-100" />
+      
+      {Icon && (
+        <div className="math-teacher-icon-chip relative z-10 transition-transform duration-300 group-hover:scale-110 group-hover:-rotate-3 group-hover:shadow-md">
+          <Icon size={18} />
+        </div>
+      )}
+      <p className="relative z-10 mt-3 text-xs font-black uppercase tracking-[0.16em] text-slate-700 transition-colors duration-300 group-hover:text-[var(--math-role-primary)] dark:text-slate-300">
+        {Label}
+      </p>
+      <p className="relative z-10 mt-1 origin-left text-3xl font-black text-slate-950 transition-transform duration-300 group-hover:scale-105 group-hover:text-[var(--math-role-primary)] dark:text-white">
+        {Value}
+      </p>
+    </div>
+  );
+}
+
+
+function TeacherCompetitionDarkHoverStyles() {
+  return (
+    <style>{`
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-surface,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-row,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-control,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-tab,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-analysis-row {
+        transition-property: background-color, border-color, color, box-shadow, transform;
+        transition-duration: 180ms;
+        transition-timing-function: ease;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-surface:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-surface:focus-visible,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-soft:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-soft:focus-visible {
+        background-color: rgba(122, 31, 88, 0.42) !important;
+        border-color: rgba(251, 207, 232, 0.72) !important;
+        box-shadow: 0 0 0 1px rgba(251, 207, 232, 0.20), 0 18px 42px rgba(88, 28, 63, 0.34) !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-row:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-row:focus-visible {
+        background-color: rgba(122, 31, 88, 0.55) !important;
+        border-color: rgba(251, 207, 232, 0.78) !important;
+        box-shadow: inset 4px 0 0 rgba(251, 207, 232, 0.80), 0 14px 34px rgba(88, 28, 63, 0.32) !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-control:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-control:focus-visible,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-surface:hover .tc-dark-hover-control,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-row:hover .tc-dark-hover-control {
+        background-color: #7a1f58 !important;
+        border-color: rgba(251, 207, 232, 0.92) !important;
+        color: #ffffff !important;
+        box-shadow: 0 10px 24px rgba(88, 28, 63, 0.46) !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-control:hover *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-control:focus-visible *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-surface:hover .tc-dark-hover-control *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-row:hover .tc-dark-hover-control * {
+        color: #ffffff !important;
+        stroke: #ffffff !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-tab:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-tab:focus-visible,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-analysis-row:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-analysis-row:focus-visible {
+        background-color: #7a1f58 !important;
+        border-color: rgba(251, 207, 232, 0.92) !important;
+        color: #ffffff !important;
+        box-shadow: 0 12px 28px rgba(88, 28, 63, 0.42) !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-tab:hover *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-tab:focus-visible *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-analysis-row:hover *,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-hover-analysis-row:focus-visible * {
+        color: #ffffff !important;
+        stroke: #ffffff !important;
+      }
+
+      .dark .teacher-competition-dark-hover-scope .tc-dark-filter:hover,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-filter:focus,
+      .dark .teacher-competition-dark-hover-scope .tc-dark-filter:focus-within {
+        background-color: rgba(122, 31, 88, 0.36) !important;
+        border-color: rgba(251, 207, 232, 0.82) !important;
+        box-shadow: 0 0 0 3px rgba(251, 207, 232, 0.16) !important;
+      }
+    `}</style>
+  );
+}
+
+function TeacherCompetitionMockTrackerContent() {
+  useProtectedPage(["TEACHER"]);
+  const [SearchText, SetSearchText] = useState("");
+  const [ModuleFilter, SetModuleFilter] = useState("ALL");
+  const [LevelFilter, SetLevelFilter] = useState("ALL");
+  const [Status, SetStatus] = useState<StatusFilter>("ALL");
+  const [ExpandedStudents, SetExpandedStudents] = useState<Set<string>>(() => new Set());
+  const [ExpandedModules, SetExpandedModules] = useState<Set<string>>(() => new Set());
+  const [ExpandedLevels, SetExpandedLevels] = useState<Set<string>>(() => new Set());
+  const [MockTableSort, SetMockTableSort] = useState<SortState>(null);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const targetModuleCode = searchParams.get("moduleCode");
+  const targetLevelCode = searchParams.get("levelCode");
+  const targetStudentId = searchParams.get("studentId");
+
+  useEffect(() => {
+    if (targetModuleCode) {
+      SetModuleFilter(targetModuleCode);
+    }
+    if (targetLevelCode) {
+      SetLevelFilter(targetLevelCode);
+    }
+    if (targetStudentId) {
+      SetExpandedStudents((prev) => new Set(prev).add(targetStudentId));
+      if (targetModuleCode) {
+        SetExpandedModules((prev) => new Set(prev).add(`${targetStudentId}::${targetModuleCode}`));
+        if (targetLevelCode) {
+          SetExpandedLevels((prev) => new Set(prev).add(`${targetStudentId}::${targetModuleCode}::${targetLevelCode}`));
+        }
+      }
+    }
+  }, [targetModuleCode, targetLevelCode, targetStudentId]);
+
+  const Query = useQuery({ queryKey: ["teacher", "competition", "mock-tracker"], queryFn: getTeacherCompetitionMockTracker });
+
+  const Rows = Query.data?.rows || [];
+
+  const ModuleOptions = useMemo(() => {
+    const Values = new Set<string>();
+    Rows.forEach((Row) => Values.add(SafeModuleLabel(Row)));
+    return Array.from(Values).sort((Left, Right) => Left.localeCompare(Right, undefined, { numeric: true, sensitivity: "base" }));
+  }, [Rows]);
+
+  const LevelOptions = useMemo(() => {
+    const Values = new Set<string>();
+    Rows.forEach((Row) => {
+      if (ModuleFilter !== "ALL" && SafeModuleLabel(Row) !== ModuleFilter) return;
+      Values.add(SafeLevelLabel(Row));
+    });
+    return Array.from(Values).sort((Left, Right) => Left.localeCompare(Right, undefined, { numeric: true, sensitivity: "base" }));
+  }, [Rows, ModuleFilter]);
+
+  const FilteredRows = useMemo(() => {
+    const Term = SearchText.trim().toLowerCase();
+    return Rows.filter((Row) => {
+      const RowStatus = String(Row.status || "ASSIGNED").toUpperCase();
+      if (ModuleFilter !== "ALL" && SafeModuleLabel(Row) !== ModuleFilter) return false;
+      if (LevelFilter !== "ALL" && SafeLevelLabel(Row) !== LevelFilter) return false;
+      if (Status === "COMPLETED" && RowStatus !== "COMPLETED") return false;
+      if (Status === "PENDING" && RowStatus === "COMPLETED") return false;
+      if (!Term) return true;
+      const Haystack = [
+        Row.student.studentName,
+        Row.student.studentCode,
+        Row.mockExam.title,
+        Row.mockExam.mockCode,
+        Row.mockExam.levelCode,
+        Row.mockExam.moduleCode,
+      ].join(" ").toLowerCase();
+      return Haystack.includes(Term);
+    });
+  }, [Rows, SearchText, ModuleFilter, LevelFilter, Status]);
+
+  const FilteredSummary = useMemo(() => {
+    const AssignedCount = FilteredRows.length;
+    const CompletedCount = FilteredRows.filter(IsCompleted).length;
+    return {
+      assignedCount: AssignedCount,
+      completedCount: CompletedCount,
+      pendingCount: Math.max(AssignedCount - CompletedCount, 0),
+      averageScore: AverageScoreValue(FilteredRows),
+      averageAccuracy: AverageOfStudentAccuracyValues(FilteredRows),
+    };
+  }, [FilteredRows]);
+
+  const GroupedRows = useMemo<StudentMockGroup[]>(() => {
+    const StudentMap = new Map<string, StudentMockGroup>();
+
+    FilteredRows.forEach((Row) => {
+      const StudentKey = Row.student.studentId || Row.student.studentCode || "student";
+      if (!StudentMap.has(StudentKey)) {
+        StudentMap.set(StudentKey, { key: StudentKey, student: Row.student, rows: [], modules: [] });
+      }
+      StudentMap.get(StudentKey)!.rows.push(Row);
+    });
+
+    return Array.from(StudentMap.values()).map((StudentGroup) => {
+      const ModuleMap = new Map<string, MockModuleGroup>();
+
+      StudentGroup.rows.forEach((Row) => {
+        const ModuleLabel = SafeModuleLabel(Row);
+        const ModuleKey = `${StudentGroup.key}::${ModuleLabel}`;
+        if (!ModuleMap.has(ModuleKey)) {
+          ModuleMap.set(ModuleKey, { key: ModuleKey, label: ModuleLabel, levels: [] });
+        }
+
+        const ModuleGroup = ModuleMap.get(ModuleKey)!;
+        const LevelLabel = SafeLevelLabel(Row);
+        const LevelKey = `${ModuleKey}::${LevelLabel}`;
+        let LevelGroup = ModuleGroup.levels.find((Item) => Item.key === LevelKey);
+        if (!LevelGroup) {
+          LevelGroup = { key: LevelKey, label: LevelLabel, rows: [] };
+          ModuleGroup.levels.push(LevelGroup);
+        }
+        LevelGroup.rows.push(Row);
+      });
+
+      return { ...StudentGroup, modules: Array.from(ModuleMap.values()) };
+    });
+  }, [FilteredRows]);
+
+
+  return (
+    <AppShell title="Competition Mock Tracker">
+      <TeacherCompetitionDarkHoverStyles />
+      <section className="teacher-competition-dark-hover-scope space-y-6">
+        <div className="math-card p-6 sm:p-8">
+          <p className="math-kicker">Competition</p>
+          <h1 className="math-title">Competition Mock Tracker</h1>
+          <p className="mt-3 text-sm font-semibold leading-6 text-slate-700 dark:text-slate-200">
+            Monitor Admin-assigned mock exams, student completion, scores, accuracy, timing, strengths, and weak areas. Teachers review only; assignment remains Admin-controlled.
+          </p>
+        </div>
+
+        {Query.isLoading ? (
+          <LoadingState label="Loading competition tracker" message="Fetching assigned mocks and student outcomes." />
+        ) : Query.isError ? (
+          <ErrorState title="Could not load competition tracker" message={apiErrorMessage(Query.error)} />
+        ) : (
+          <>
+            <div className="grid gap-4 xl:grid-cols-5 md:grid-cols-2">
+              <MetricCard Icon={UsersRound} Label="Assigned" Value={FilteredSummary.assignedCount} />
+              <MetricCard Icon={ShieldCheck} Label="Completed" Value={FilteredSummary.completedCount} />
+              <MetricCard Icon={Clock3} Label="Pending" Value={FilteredSummary.pendingCount} />
+              <MetricCard Icon={Trophy} Label="Avg Score" Value={FilteredSummary.averageScore} />
+              <MetricCard Icon={BarChart3} Label="Avg Accuracy" Value={`${FilteredSummary.averageAccuracy}%`} />
+            </div>
+
+            <div className="grid gap-5">
+              <article className="math-card p-5 sm:p-6">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                  <div>
+                    <p className="math-kicker">Monitor</p>
+                    <h2 className="text-2xl font-black text-slate-950 dark:text-white">Student Mock Outcomes</h2>
+                    <p className="mt-2 text-sm font-semibold text-slate-700 dark:text-slate-200">
+                      Review completion status, score, accuracy, and time taken for your students.
+                    </p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[1.35fr_180px_180px_180px] xl:w-[820px]">
+                    <label className="tc-dark-filter flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-700 shadow-sm transition hover:border-[#7a1f58] focus-within:border-[#7a1f58] focus-within:ring-2 focus-within:ring-[#7a1f58]/20 dark:border-white/10 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:border-rose-200/90 dark:hover:bg-rose-500/20 dark:focus-within:border-rose-300 dark:focus-within:bg-rose-500/20 dark:focus-within:ring-rose-300/25">
+                      <Search size={16} className="text-[#7a1f58] dark:text-rose-100" />
+                      <input
+                        value={SearchText}
+                        onChange={(Event) => SetSearchText(Event.target.value)}
+                        placeholder="Search student, mock, code, or level"
+                        className="w-full bg-transparent outline-none placeholder:text-slate-400"
+                      />
+                    </label>
+                    <select
+                      value={ModuleFilter}
+                      onChange={(Event) => {
+                        SetModuleFilter(Event.target.value);
+                        SetLevelFilter("ALL");
+                      }}
+                      className="tc-dark-filter rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-700 shadow-sm outline-none transition hover:border-[#7a1f58] focus:border-[#7a1f58] focus:ring-2 focus:ring-[#7a1f58]/20 dark:border-white/10 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:border-rose-200/90 dark:hover:bg-rose-500/20 dark:focus:border-rose-300 dark:focus:bg-rose-500/20 dark:focus:ring-rose-300/25"
+                    >
+                      <option value="ALL">All Modules</option>
+                      {ModuleOptions.map((Module) => (
+                        <option key={Module} value={Module}>{Module}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={LevelFilter}
+                      onChange={(Event) => SetLevelFilter(Event.target.value)}
+                      className="tc-dark-filter rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-700 shadow-sm outline-none transition hover:border-[#7a1f58] focus:border-[#7a1f58] focus:ring-2 focus:ring-[#7a1f58]/20 dark:border-white/10 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:border-rose-200/90 dark:hover:bg-rose-500/20 dark:focus:border-rose-300 dark:focus:bg-rose-500/20 dark:focus:ring-rose-300/25"
+                    >
+                      <option value="ALL">All Levels</option>
+                      {LevelOptions.map((Level) => (
+                        <option key={Level} value={Level}>{Level}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={Status}
+                      onChange={(Event) => SetStatus(Event.target.value as StatusFilter)}
+                      className="tc-dark-filter rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-700 shadow-sm outline-none transition hover:border-[#7a1f58] focus:border-[#7a1f58] focus:ring-2 focus:ring-[#7a1f58]/20 dark:border-white/10 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:border-rose-200/90 dark:hover:bg-rose-500/20 dark:focus:border-rose-300 dark:focus:bg-rose-500/20 dark:focus:ring-rose-300/25"
+                    >
+                      <option value="ALL">All Statuses</option>
+                      <option value="PENDING">Pending</option>
+                      <option value="COMPLETED">Completed</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="mt-5 space-y-3">
+                  {GroupedRows.length === 0 ? (
+                    <EmptyState title="No competition mock records" message="Assigned competition mock outcomes for your students will appear here." />
+                  ) : (
+                    GroupedRows.map((StudentGroup) => {
+                      const StudentOpen = ExpandedStudents.has(StudentGroup.key);
+                      const CompletedCount = StudentGroup.rows.filter(IsCompleted).length;
+                      const PendingCountForStudent = StudentGroup.rows.length - CompletedCount;
+                      return (
+                        <div key={StudentGroup.key} className="overflow-hidden rounded-3xl border border-[#7a1f58]/15 bg-white shadow-sm ring-1 ring-rose-100/70 dark:border-rose-300/15 dark:bg-slate-950/35 dark:ring-white/10">
+                          <button
+                            type="button"
+                            onClick={() => ToggleExpanded(SetExpandedStudents, StudentGroup.key)}
+                            className="tc-dark-hover-surface group flex w-full flex-col gap-3 bg-[#7a1f58]/[0.025] px-4 py-4 text-left transition hover:bg-[#7a1f58]/[0.055] sm:flex-row sm:items-center sm:justify-between dark:bg-rose-400/5 dark:hover:bg-rose-500/25 dark:hover:shadow-lg dark:hover:shadow-rose-950/30 dark:focus-visible:ring-2 dark:focus-visible:ring-rose-300/30"
+                          >
+                            <div className="flex min-w-0 items-center gap-3">
+                              <span className="tc-dark-hover-control inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border border-[#7a1f58]/25 bg-white text-[#7a1f58] shadow-sm ring-1 ring-[#7a1f58]/10 transition group-hover:bg-[#7a1f58]/5 dark:border-rose-300/30 dark:bg-slate-950/50 dark:text-rose-100 dark:ring-rose-300/10 dark:group-hover:bg-rose-500/25">
+                                {StudentOpen ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
+                              </span>
+                              <div className="min-w-0">
+                                <h3 className="truncate text-lg font-black text-slate-950 dark:text-white">{StudentGroup.student.studentName}</h3>
+                                <p className="mt-1 text-xs font-black uppercase tracking-[0.12em] text-[#7a1f58] dark:text-rose-100">{StudentGroup.student.studentCode}</p>
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-xs font-black">
+                              {AverageAccuracyChip(StudentGroup.rows)}
+                              <Chip tone="amber">{StudentGroup.rows.length} Mock{StudentGroup.rows.length === 1 ? "" : "s"}</Chip>
+                              <Chip tone="green">{CompletedCount} Completed</Chip>
+                              <Chip tone="amber">{PendingCountForStudent} Pending</Chip>
+                            </div>
+                          </button>
+
+                          {StudentOpen ? (
+                            <div className="space-y-3 border-t border-[#7a1f58]/10 p-4 dark:border-rose-300/10">
+                              {StudentGroup.modules.map((ModuleGroup) => {
+                                const ModuleOpen = ExpandedModules.has(ModuleGroup.key);
+                                const ModuleRows = ModuleGroup.levels.flatMap((Level) => Level.rows);
+                                return (
+                                  <div key={ModuleGroup.key} className="overflow-hidden rounded-3xl border border-slate-200 bg-slate-50/60 dark:border-white/10 dark:bg-white/5">
+                                    <button
+                                      type="button"
+                                      onClick={() => ToggleExpanded(SetExpandedModules, ModuleGroup.key)}
+                                      className="tc-dark-hover-soft flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-[#7a1f58]/[0.045] dark:hover:bg-rose-500/25 dark:hover:shadow-md dark:hover:shadow-rose-950/25 dark:focus-visible:ring-2 dark:focus-visible:ring-rose-300/30"
+                                    >
+                                      <div className="flex min-w-0 items-center gap-3">
+                                        <span className="tc-dark-hover-control inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[#7a1f58]/20 bg-white text-[#7a1f58] dark:border-rose-300/30 dark:bg-slate-950/50 dark:text-rose-100">
+                                          {ModuleOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                                        </span>
+                                        <div>
+                                          <p className="text-[0.64rem] font-black uppercase tracking-[0.16em] text-[#7a1f58] dark:text-rose-100">Module</p>
+                                          <p className="text-sm font-black text-slate-950 dark:text-white">{ModuleGroup.label}</p>
+                                        </div>
+                                      </div>
+                                      <div className="flex flex-wrap justify-end gap-2 text-xs font-black">
+                                        {AverageAccuracyChip(ModuleRows)}
+                                        <Chip tone="amber">{ModuleRows.length} Mock{ModuleRows.length === 1 ? "" : "s"}</Chip>
+                                      </div>
+                                    </button>
+
+                                    {ModuleOpen ? (
+                                      <div className="space-y-3 border-t border-slate-200 p-3 dark:border-white/10">
+                                        {ModuleGroup.levels.map((LevelGroup) => {
+                                          const LevelOpen = ExpandedLevels.has(LevelGroup.key);
+                                          const LevelCompleted = LevelGroup.rows.filter(IsCompleted).length;
+                                          return (
+                                            <div key={LevelGroup.key} className="overflow-hidden rounded-2xl border border-white bg-white shadow-sm dark:border-white/10 dark:bg-slate-950/35">
+                                              <button
+                                                type="button"
+                                                onClick={() => ToggleExpanded(SetExpandedLevels, LevelGroup.key)}
+                                                className="tc-dark-hover-soft flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-[#7a1f58]/[0.04] dark:hover:bg-rose-500/25 dark:hover:shadow-md dark:hover:shadow-rose-950/25 dark:focus-visible:ring-2 dark:focus-visible:ring-rose-300/30"
+                                              >
+                                                <div className="flex min-w-0 items-center gap-3">
+                                                  <span className="tc-dark-hover-control inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[#7a1f58]/20 bg-[#7a1f58]/5 text-[#7a1f58] dark:border-rose-300/30 dark:bg-rose-400/10 dark:text-rose-100">
+                                                    {LevelOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                                                  </span>
+                                                  <div>
+                                                    <p className="text-[0.64rem] font-black uppercase tracking-[0.16em] text-[#7a1f58] dark:text-rose-100">Level</p>
+                                                    <p className="text-sm font-black text-slate-950 dark:text-white">{LevelGroup.label}</p>
+                                                  </div>
+                                                </div>
+                                                <div className="flex flex-wrap gap-2 text-xs font-black">
+                                                  {AverageAccuracyChip(LevelGroup.rows)}
+                                                  <Chip tone="amber">{LevelGroup.rows.length} Mock{LevelGroup.rows.length === 1 ? "" : "s"}</Chip>
+                                                  <Chip tone="green">{LevelCompleted} Completed</Chip>
+                                                </div>
+                                              </button>
+
+                                              {LevelOpen ? (
+                                                <div className="border-t border-slate-100 p-3 dark:border-white/10">
+                                                  <div className="overflow-hidden rounded-2xl border border-[#7a1f58]/15 bg-white shadow-sm dark:border-white/10 dark:bg-slate-950/35">
+                                                    <div className="w-full overflow-x-auto">
+                                                      <div className="min-w-[900px] xl:min-w-0">
+                                                        <div className="math-tc-mock-header-row grid grid-cols-[1.15fr_1fr_0.8fr_0.8fr_0.8fr_1fr_1fr_1fr_0.85fr] gap-0">
+                                                          {MockTableColumns.map((Column) => (
+                                                            <div key={Column.label} className="math-tc-mock-header-cell px-3 py-3">
+                                                              {Column.key ? (
+                                                                <button
+                                                                  type="button"
+                                                                  onClick={() => SetMockTableSort((Current) => NextSortState(Current, Column.key!))}
+                                                                  className="math-tc-mock-header-sort-btn inline-flex items-center gap-1.5 rounded-lg px-1 py-0.5 text-left transition focus:outline-none focus:ring-2"
+                                                                  aria-label={`Sort by ${Column.label}`}
+                                                                >
+                                                                  <span>{Column.label}</span>
+                                                                  <SortIndicator Sort={MockTableSort} ColumnKey={Column.key} />
+                                                                </button>
+                                                              ) : (
+                                                                Column.label
+                                                              )}
+                                                            </div>
+                                                          ))}
+                                                        </div>
+                                                        <div className="divide-y divide-slate-100 dark:divide-white/10">
+                                                          {SortRows(LevelGroup.rows, MockTableSort).map((Row) => (
+                                                            <div
+                                                              key={Row.assignmentId}
+                                                              role={Row.attemptId ? "button" : undefined}
+                                                              tabIndex={Row.attemptId ? 0 : -1}
+                                                              onClick={() => Row.attemptId ? router.push(`/teacher/competition/mock-result/${Row.attemptId}`) : undefined}
+                                                              onKeyDown={(Event) => {
+                                                                if (Row.attemptId && (Event.key === "Enter" || Event.key === " ")) {
+                                                                  Event.preventDefault();
+                                                                  router.push(`/teacher/competition/mock-result/${Row.attemptId}`);
+                                                                }
+                                                              }}
+                                                              className={`tc-dark-hover-row group grid grid-cols-[1.15fr_1fr_0.8fr_0.8fr_0.8fr_1fr_1fr_1fr_0.85fr] items-center gap-0 transition ${Row.attemptId ? "cursor-pointer hover:bg-[#7a1f58]/[0.035] dark:hover:bg-rose-500/25 dark:hover:shadow-md dark:hover:shadow-rose-950/25 dark:focus-visible:ring-2 dark:focus-visible:ring-rose-300/30" : "bg-slate-50/40 dark:bg-white/[0.02]"}`}
+                                                            >
+                                                              <div className="px-3 py-4 text-sm font-black text-slate-950 dark:text-white">{Row.mockExam.title}</div>
+                                                              <div className="px-3 py-4 text-xs font-black text-slate-950 dark:text-white">{Row.mockExam.mockCode || "-"}</div>
+                                                              <div className="px-3 py-4">
+                                                                <Chip tone={StatusTone(Row.status)}>{StatusLabel(Row.status)}</Chip>
+                                                              </div>
+                                                              <div className="px-3 py-4">
+                                                                <Chip tone={AccuracyBandTone(ScorePercentage(Row))}>
+                                                                  {ScoreText(Row)}
+                                                                </Chip>
+                                                              </div>
+                                                              <div className="px-3 py-4">
+                                                                <Chip tone={AccuracyBandTone(IsCompleted(Row) && Row.accuracyPercentage != null ? Number(Row.accuracyPercentage) : null)}>
+                                                                  {IsCompleted(Row) ? PercentValue(Row.accuracyPercentage) : "-"}
+                                                                </Chip>
+                                                              </div>
+                                                              <div className="px-3 py-4 text-sm font-bold text-slate-950 dark:text-white">{IsCompleted(Row) ? (Row.timeTakenText || "-") : "-"}</div>
+                                                              <div className="px-3 py-4 text-sm font-bold text-slate-950 dark:text-white">{FormatDate(Row.assignedAt)}</div>
+                                                              <div className="px-3 py-4 text-sm font-bold text-slate-950 dark:text-white">{IsCompleted(Row) ? FormatDate(Row.submittedAt) : "-"}</div>
+                                                              <div className="px-3 py-4">
+                                                                <ReviewButton Row={Row} />
+                                                              </div>
+                                                            </div>
+                                                          ))}
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </article>
+            </div>
+          </>
+        )}
+      </section>
+    </AppShell>
+  );
+}
+
+function MiniMetric({ Label, Value }: { Label: string; Value: string | number }) {
+  return (
+    <div className="group relative overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:shadow-xl math-teacher-light-metric-card rounded-[22px] border border-rose-200/70 bg-white/85 p-4 shadow-sm ring-1 ring-rose-100/80 dark:border-white/10 dark:bg-slate-950/75 dark:ring-white/10">
+      {/* Gamified hover shine */}
+      <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/40 to-transparent opacity-0 transition-all duration-700 group-hover:translate-x-full group-hover:opacity-100" />
+      
+      <p className="relative z-10 text-xs font-black uppercase tracking-[0.16em] text-slate-700 transition-colors duration-300 group-hover:text-[var(--math-role-primary)] dark:text-slate-300">
+        {Label}
+      </p>
+      <p className="relative z-10 mt-1 origin-left text-3xl font-black text-slate-950 transition-transform duration-300 group-hover:scale-105 group-hover:text-[var(--math-role-primary)] dark:text-white">
+        {Value}
+      </p>
+    </div>
+  );
+}
+
+
+export default function TeacherCompetitionMockTrackerPage() {
+  return (
+    <Suspense fallback={<LoadingState />}>
+      <TeacherCompetitionMockTrackerContent />
+    </Suspense>
+  );
+}

@@ -1,0 +1,253 @@
+'use client';
+
+import React, { useEffect, useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { cn } from '@/lib/utils';
+import { motion, AnimatePresence } from 'framer-motion';
+import { X, Award, Zap, Lock, CheckCircle2, ChevronRight, ChevronLeft, Info } from 'lucide-react';
+import { RankBadge } from './RankBadge';
+import { RankCinematicOverlay } from './RankCinematicOverlay';
+import { RankGuideModal } from './RankGuideModal';
+
+export interface RankInspectionModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  currentXp: number;
+  currentRankTier: string;
+}
+
+const RANK_LIST = ['COPPER', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'CHAMPION'];
+
+export function RankInspectionModal({ isOpen, onClose, currentXp, currentRankTier }: RankInspectionModalProps) {
+  const [mounted, setMounted] = useState(false);
+  const [activeCinematicTier, setActiveCinematicTier] = useState<string | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setMounted(true);
+    return () => setMounted(false);
+  }, []);
+
+  if (!mounted) return null;
+
+  const parts = currentRankTier.split('_');
+  const baseRank = parts[0] || 'COPPER';
+  const numeral = parts[1] || '';
+
+  const currentIndex = RANK_LIST.indexOf(baseRank);
+
+  // React Portal to body to bypass any parent styling constraints
+  return createPortal(
+    <AnimatePresence>
+      {isOpen && (
+        <div className="fixed inset-0 z-[99999] flex items-center justify-center p-4 md:p-8 pointer-events-auto">
+          {/* Intense Cinematic Backdrop */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+            className="absolute inset-0 bg-slate-950/80 backdrop-blur-[40px] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-indigo-900/20 via-slate-950/80 to-black"
+          />
+
+          {/* Epic Modal Container */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 30 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: 30 }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="relative w-full max-w-[95vw] lg:max-w-7xl max-h-[90vh] bg-slate-950/60 border border-indigo-500/30 rounded-[2rem] shadow-[0_0_100px_rgba(79,70,229,0.15)] overflow-hidden flex flex-col z-10 backdrop-blur-md"
+          >
+            {/* Top-Right Action Buttons */}
+            <div className="absolute top-6 right-6 z-50 flex items-center gap-4">
+              <button
+                onClick={() => setShowGuide(true)}
+                className="px-4 py-2 bg-indigo-600/20 border border-indigo-500/50 hover:bg-indigo-600/40 rounded-full text-indigo-300 hover:text-white transition-all hover:scale-105 shadow-xl hover:shadow-[0_0_15px_rgba(79,70,229,0.4)] flex items-center gap-2 backdrop-blur-md"
+              >
+                <Info className="w-5 h-5" />
+                <span className="text-sm font-black uppercase tracking-widest hidden md:block">System Guide</span>
+              </button>
+              <button
+                onClick={onClose}
+                className="p-3 bg-slate-900/80 border border-slate-800 hover:border-slate-600 rounded-full text-slate-400 hover:text-white transition-all hover:scale-105 shadow-xl hover:shadow-[0_0_15px_rgba(255,255,255,0.1)] backdrop-blur-md"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            {/* Header Section */}
+            <div className="relative p-6 md:p-8 pb-6 overflow-hidden border-b border-slate-800/60 bg-gradient-to-b from-slate-900/80 to-slate-950">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-indigo-500 to-transparent opacity-50" />
+
+              <div className="flex items-center gap-3 mb-3">
+                <Award className="w-6 h-6 text-indigo-400" />
+                <span className="text-sm font-black text-indigo-400 uppercase tracking-[0.2em] shadow-indigo-500/50">RANK CONQUEST ROADMAP</span>
+              </div>
+              <h2 className="text-5xl font-black text-white uppercase tracking-tighter drop-shadow-md">
+                Division Pathway
+              </h2>
+              <p className="text-slate-400 text-lg mt-2 max-w-none md:whitespace-nowrap">
+                Track your ascension through the MathPath divisions. Conquer lessons to unlock legendary tiers.
+              </p>
+
+              <div className="absolute right-10 bottom-8 hidden md:flex flex-col items-end gap-1.5">
+                <span className="text-[10px] font-black text-indigo-400/80 uppercase tracking-[0.2em] shadow-indigo-500/50 drop-shadow-sm">TOTAL ACQUIRED XP</span>
+                <div className="bg-indigo-950/40 border border-indigo-500/30 rounded-2xl px-5 py-2 flex items-center gap-2 shadow-[inset_0_2px_10px_rgba(0,0,0,0.5)] backdrop-blur-md">
+                  <span className="text-3xl font-black text-white tracking-tight drop-shadow-[0_0_10px_rgba(255,255,255,0.2)]">
+                    {currentXp.toLocaleString()}
+                  </span>
+                  <span className="text-sm font-black text-indigo-300 mt-1">XP</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Visual Roadmap Body */}
+            <div className="flex-1 overflow-hidden p-6 md:p-8 relative bg-[radial-gradient(circle_at_bottom,_var(--tw-gradient-stops))] from-indigo-950/20 via-transparent to-transparent flex flex-col justify-center">
+              {/* Background Grid Texture */}
+              <div className="absolute inset-0 opacity-20 pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)', backgroundSize: '60px 60px' }} />
+
+              {/* Navigation Arrows */}
+              <button
+                onClick={() => scrollContainerRef.current?.scrollBy({ left: -400, behavior: 'smooth' })}
+                className="absolute left-4 top-1/2 -translate-y-1/2 z-50 p-3 bg-slate-900/90 border border-indigo-500/50 hover:bg-indigo-600 rounded-full text-indigo-400 hover:text-white transition-all shadow-[0_0_20px_rgba(79,70,229,0.3)] hover:scale-110 hidden md:block"
+              >
+                <ChevronLeft className="w-6 h-6" />
+              </button>
+
+              <button
+                onClick={() => scrollContainerRef.current?.scrollBy({ left: 400, behavior: 'smooth' })}
+                className="absolute right-4 top-1/2 -translate-y-1/2 z-50 p-3 bg-slate-900/90 border border-indigo-500/50 hover:bg-indigo-600 rounded-full text-indigo-400 hover:text-white transition-all shadow-[0_0_20px_rgba(79,70,229,0.3)] hover:scale-110 hidden md:block"
+              >
+                <ChevronRight className="w-6 h-6" />
+              </button>
+
+              <div ref={scrollContainerRef} className="relative w-full overflow-x-auto pb-24 pt-12 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+                <div className="relative min-w-[1200px] w-full mx-auto px-10">
+                  {/* Connecting Line (Underneath Badges) */}
+                <div className="absolute top-1/2 left-0 right-0 h-2 -translate-y-1/2 bg-slate-900 rounded-full overflow-hidden shadow-[inset_0_2px_4px_rgba(0,0,0,0.6)]">
+                  {/* Glowing progress fill */}
+                  <motion.div
+                    initial={{ width: 0 }}
+                    animate={{ width: `${(currentIndex / (RANK_LIST.length - 1)) * 100}%` }}
+                    transition={{ duration: 1.5, ease: "easeOut", delay: 0.2 }}
+                    className="h-full bg-gradient-to-r from-indigo-600 via-purple-500 to-indigo-400 shadow-[0_0_20px_rgba(99,102,241,0.8)] relative"
+                  >
+                    <div className="absolute inset-0 bg-white/20 animate-pulse" />
+                  </motion.div>
+                </div>
+
+                {/* Rank Tiers Sequence */}
+                <div className="relative flex justify-between items-center w-full">
+                  {RANK_LIST.map((rankName, index) => {
+                    const isCompleted = index < currentIndex;
+                    const isActive = index === currentIndex;
+                    const isLocked = index > currentIndex;
+
+                    return (
+                      <div key={rankName} className="flex flex-col items-center justify-center relative group">
+
+                        {/* Hover/Active Spotlight */}
+                        {isActive && (
+                          <div className="absolute -inset-10 bg-indigo-500/20 rounded-full blur-[40px] pointer-events-none animate-pulse" />
+                        )}
+
+                        <div
+                          className={cn(
+                            "relative z-10 transition-all duration-500 transform-gpu will-change-transform",
+                            isLocked
+                              ? "grayscale opacity-40 hover:opacity-100 transition-all duration-300 cursor-not-allowed"
+                              : isActive
+                                ? "scale-110 md:scale-125 z-20 hover:scale-125 cursor-pointer"
+                                : "opacity-90 hover:scale-110 hover:z-20 cursor-pointer"
+                          )}
+                          onClick={() => {
+                            // Lock logic: Only allow cinematic if the tier is unlocked (active or completed)
+                            if (!isLocked) {
+                              setActiveCinematicTier(rankName);
+                            }
+                          }}
+                        >
+                          <RankBadge
+                            tier={isActive ? currentRankTier : rankName}
+                            size="lg"
+                            className={cn("pointer-events-none", isActive && "drop-shadow-[0_0_40px_rgba(99,102,241,0.6)]")}
+                          />
+
+                          {/* Status Icon Overlay */}
+                          {isCompleted && (
+                            <div className="absolute -bottom-2 -right-2 bg-slate-900 rounded-full p-1 border border-indigo-500 shadow-lg pointer-events-none">
+                              <CheckCircle2 className="w-4 h-4 text-indigo-400" />
+                            </div>
+                          )}
+                          {isLocked && (
+                            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-slate-950/80 rounded-full p-2.5 border border-slate-800 shadow-xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                              <Lock className="w-5 h-5 text-slate-400" />
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Isometric Pedestal & Label */}
+                        <div className={cn(
+                          "absolute -bottom-24 flex flex-col items-center transition-all duration-500 w-full",
+                          isActive ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8 group-hover:opacity-100 group-hover:translate-y-4"
+                        )}>
+                          {isActive && (
+                            <div className="relative w-24 h-8 mb-4">
+                              {/* 3D Isometric Pedestal */}
+                              <div className="absolute inset-0 bg-indigo-500/30 blur-xl rounded-full animate-pulse" />
+                              <div className="absolute top-0 left-1/2 -translate-x-1/2 w-24 h-6 bg-slate-800 rounded-[50%] border-2 border-indigo-500/50 shadow-[0_0_30px_rgba(99,102,241,0.4)]" />
+                              <div className="absolute top-3 left-1/2 -translate-x-1/2 w-24 h-6 bg-slate-900 rounded-[50%] border border-slate-700 shadow-[inset_0_-5px_10px_rgba(0,0,0,0.8)]" />
+                              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 w-[2px] h-32 bg-gradient-to-t from-indigo-500/0 via-indigo-400/80 to-indigo-500/0 -z-10 blur-[1px]" />
+                            </div>
+                          )}
+                          <span className={cn(
+                            "text-[10px] md:text-sm font-black uppercase tracking-widest whitespace-nowrap",
+                            isActive ? "text-indigo-400 drop-shadow-[0_0_8px_rgba(99,102,241,0.8)]" : isCompleted ? "text-slate-400" : "text-slate-600"
+                          )}>
+                            {rankName}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Motivational Footer Banner */}
+              <div className="mt-6 mx-auto max-w-3xl bg-gradient-to-r from-indigo-950/30 via-purple-900/20 to-indigo-950/30 border border-indigo-500/20 p-6 rounded-2xl flex flex-col md:flex-row items-center gap-6 shadow-2xl">
+                <div className="w-12 h-12 rounded-full bg-indigo-950/50 flex items-center justify-center border border-indigo-500/30 shrink-0">
+                  <Zap className="w-6 h-6 text-indigo-400" />
+                </div>
+                <div>
+                  <h4 className="text-lg font-black text-white uppercase tracking-tight">The Grind Continues</h4>
+                  <p className="text-sm text-indigo-200/70 leading-relaxed font-medium mt-1">
+                    "Only those who commit to the grind of the equation will stand atop the Champion podium. Your path is set. Conquer the next lesson."
+                  </p>
+                </div>
+                <div className="shrink-0 md:ml-auto">
+                  <button onClick={onClose} className="px-6 py-3 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-black uppercase tracking-widest rounded-xl transition-colors shadow-[0_0_20px_rgba(79,70,229,0.4)] flex items-center gap-2">
+                    Back to Dashboard <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+          </motion.div>
+        </div>
+      )}
+      {activeCinematicTier && (
+        <RankCinematicOverlay
+          tier={activeCinematicTier}
+          onComplete={() => setActiveCinematicTier(null)}
+        />
+      )}
+      <RankGuideModal
+        isOpen={showGuide}
+        onClose={() => setShowGuide(false)}
+      />
+    </AnimatePresence>,
+    document.body
+  );
+}
